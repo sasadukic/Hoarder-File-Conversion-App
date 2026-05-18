@@ -5,6 +5,17 @@ from typing import Callable, List, Optional
 
 from cue_parser import Track
 
+# Bundled ffmpeg lives in bin/ffmpeg.exe next to this file.
+# Falls back to system PATH if the bundled copy is missing.
+_LOCAL_FFMPEG = Path(__file__).parent / "bin" / "ffmpeg.exe"
+
+
+def _ffmpeg_exe() -> str:
+    """Return path to ffmpeg: bundled bin/ffmpeg.exe if present, else 'ffmpeg' (PATH)."""
+    if _LOCAL_FFMPEG.exists():
+        return str(_LOCAL_FFMPEG)
+    return "ffmpeg"
+
 
 def _run_ffmpeg(cmd: List[str], error_prefix: str) -> None:
     """Run an ffmpeg command. Raises RuntimeError with error_prefix on failure."""
@@ -14,7 +25,9 @@ def _run_ffmpeg(cmd: List[str], error_prefix: str) -> None:
 
 
 def check_ffmpeg() -> bool:
-    """Return True if ffmpeg is available on PATH."""
+    """Return True if ffmpeg is available (bundled bin/ or system PATH)."""
+    if _LOCAL_FFMPEG.exists():
+        return True
     return shutil.which("ffmpeg") is not None
 
 
@@ -28,6 +41,7 @@ def split_and_convert(
     progress_callback(current, total) is called before each track.
     Raises RuntimeError on ffmpeg failure.
     """
+    ffmpeg = _ffmpeg_exe()
     flac = Path(flac_path)
     total = len(tracks)
 
@@ -36,7 +50,7 @@ def split_and_convert(
         stem = f"{track.number:02d} - {track.title}"
         out = flac.parent / f"{stem}.mp3"
 
-        cmd = ["ffmpeg", "-y", "-ss", str(track.start)]
+        cmd = [ffmpeg, "-y", "-ss", str(track.start)]
         if track.end is not None:
             cmd += ["-to", str(track.end)]
         cmd += ["-i", str(flac), "-b:a", "320k", str(out)]
@@ -53,6 +67,7 @@ def convert_files(
     progress_callback(current, total) is called before each file.
     Raises RuntimeError on ffmpeg failure.
     """
+    ffmpeg = _ffmpeg_exe()
     total = len(flac_paths)
 
     for i, flac_path in enumerate(flac_paths, start=1):
@@ -60,7 +75,7 @@ def convert_files(
         flac = Path(flac_path)
         out = flac.parent / (flac.stem + ".mp3")
 
-        cmd = ["ffmpeg", "-y", "-i", str(flac), "-b:a", "320k", str(out)]
+        cmd = [ffmpeg, "-y", "-i", str(flac), "-b:a", "320k", str(out)]
         _run_ffmpeg(cmd, f"Error on file {i} ({flac.name})")
 
 

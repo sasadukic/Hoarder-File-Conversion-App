@@ -10,14 +10,24 @@ from cue_parser import Track
 
 # --- check_ffmpeg ---
 
-def test_check_ffmpeg_found():
-    with patch("converter.shutil.which", return_value="/usr/bin/ffmpeg"):
+def test_check_ffmpeg_bundled_exists():
+    # Simulate bundled bin/ffmpeg.exe present — should return True without touching PATH
+    with patch("converter._LOCAL_FFMPEG", new=Path(__file__)):  # __file__ always exists
         assert check_ffmpeg() is True
 
 
+def test_check_ffmpeg_system_path_found():
+    # No bundled exe, but found on system PATH
+    with patch("converter._LOCAL_FFMPEG", new=Path("/nonexistent/ffmpeg.exe")):
+        with patch("converter.shutil.which", return_value="/usr/bin/ffmpeg"):
+            assert check_ffmpeg() is True
+
+
 def test_check_ffmpeg_not_found():
-    with patch("converter.shutil.which", return_value=None):
-        assert check_ffmpeg() is False
+    # No bundled exe and not on PATH
+    with patch("converter._LOCAL_FFMPEG", new=Path("/nonexistent/ffmpeg.exe")):
+        with patch("converter.shutil.which", return_value=None):
+            assert check_ffmpeg() is False
 
 
 # --- split_and_convert ---
