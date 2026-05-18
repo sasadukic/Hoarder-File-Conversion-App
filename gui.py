@@ -9,6 +9,8 @@ from tkinterdnd2 import TkinterDnD, DND_FILES
 
 from cue_parser import parse_cue
 from converter import check_ffmpeg, split_and_convert, convert_files, delete_flacs
+import settings as smod
+import monitor as mmod
 
 MODE_SPLIT = "Split + Convert"
 MODE_CONVERT = "Convert Only"
@@ -71,7 +73,7 @@ class App(TkinterDnD.Tk):
         ctk.set_default_color_theme("blue")
 
         self.title("FLAC to MP3 Converter")
-        self.geometry("500x410")
+        self.geometry("500x530")
         self.resizable(False, False)
         self.configure(bg="#1a1a1a")
 
@@ -79,9 +81,16 @@ class App(TkinterDnD.Tk):
         self._cue_path: Optional[str] = None
         self._mode: Optional[str] = None
 
+        self._settings = smod.load()
+        self._monitor: mmod.FolderMonitor | None = None
+        self._hiding_to_tray = False
+        self._tray_icon = None
+
         self._build_ui()
 
     def _build_ui(self) -> None:
+        s = self._settings
+
         # Drop zone frame
         self._drop_frame = tk.Frame(
             self,
@@ -102,7 +111,6 @@ class App(TkinterDnD.Tk):
         )
         self._drop_label.place(relx=0.5, rely=0.5, anchor="center")
 
-        # Drag-and-drop targets
         for widget in (self._drop_frame, self._drop_label):
             widget.drop_target_register(DND_FILES)
             widget.dnd_bind("<<Drop>>", self._on_drop)
@@ -121,15 +129,69 @@ class App(TkinterDnD.Tk):
         )
         self._info_label.place(x=20, y=185, width=460, height=50)
 
-        # Delete checkbox
-        self._delete_var = tk.BooleanVar(value=False)
+        # --- Checkboxes ---
+        self._delete_var = tk.BooleanVar(value=s["delete_flac"])
         self._delete_check = ctk.CTkCheckBox(
-            self,
-            text="Delete FLAC after conversion",
-            variable=self._delete_var,
-            font=("Segoe UI", 11),
+            self, text="Delete FLAC after conversion",
+            variable=self._delete_var, font=("Segoe UI", 11),
         )
         self._delete_check.place(x=20, y=245)
+
+        self._auto_convert_var = tk.BooleanVar(value=s["auto_convert"])
+        self._auto_check = ctk.CTkCheckBox(
+            self, text="Auto-convert on load",
+            variable=self._auto_convert_var, font=("Segoe UI", 11),
+        )
+        self._auto_check.place(x=20, y=275)
+
+        self._tray_var = tk.BooleanVar(value=s["minimize_to_tray"])
+        self._tray_check = ctk.CTkCheckBox(
+            self, text="Minimize to tray",
+            variable=self._tray_var, font=("Segoe UI", 11),
+            command=self._on_tray_toggle,
+        )
+        self._tray_check.place(x=20, y=305)
+
+        self._startup_var = tk.BooleanVar(value=s["start_on_startup"])
+        self._startup_check = ctk.CTkCheckBox(
+            self, text="Start on Windows startup",
+            variable=self._startup_var, font=("Segoe UI", 11),
+            command=self._on_startup_toggle,
+        )
+        self._startup_check.place(x=20, y=335)
+
+        # --- Folder monitor row ---
+        self._monitor_var = tk.BooleanVar(value=False)
+        self._monitor_check = ctk.CTkCheckBox(
+            self, text="Monitor folder",
+            variable=self._monitor_var, font=("Segoe UI", 11),
+            command=self._on_monitor_toggle,
+        )
+        self._monitor_check.place(x=20, y=365)
+
+        self._monitor_browse_btn = ctk.CTkButton(
+            self, text="Browse…", font=("Segoe UI", 11),
+            width=90, height=26,
+            command=self._browse_monitor_folder,
+        )
+        self._monitor_browse_btn.place(x=390, y=365)
+
+        self._monitor_folder_var = tk.StringVar(
+            value=s["monitor_folder"] or ""
+        )
+        self._monitor_folder_label = tk.Label(
+            self,
+            textvariable=self._monitor_folder_var,
+            bg="#1a1a1a", fg="#888888",
+            font=("Segoe UI", 9),
+            anchor="w", wraplength=460,
+        )
+        self._monitor_folder_label.place(x=20, y=393, width=460, height=20)
+
+        # Restore monitor enabled state (only if folder is saved)
+        if s["monitor_folder"] and s["monitor_enabled"]:
+            self._monitor_var.set(True)
+            self._start_monitor(s["monitor_folder"])
 
         # Convert button
         self._convert_btn = ctk.CTkButton(
@@ -141,7 +203,7 @@ class App(TkinterDnD.Tk):
             width=460,
             height=45,
         )
-        self._convert_btn.place(x=20, y=295)
+        self._convert_btn.place(x=20, y=423)
 
         # Status line
         self._status_label = tk.Label(
@@ -153,7 +215,18 @@ class App(TkinterDnD.Tk):
             wraplength=460,
             anchor="w",
         )
-        self._status_label.place(x=20, y=350, width=460, height=40)
+        self._status_label.place(x=20, y=478, width=460, height=40)
+
+        # Settings traces (save on any change)
+        for var in (
+            self._delete_var, self._auto_convert_var,
+            self._tray_var, self._startup_var,
+            self._monitor_var, self._monitor_folder_var,
+        ):
+            var.trace_add("write", lambda *_: self._save_settings())
+
+        # Tray: bind minimize event
+        self.bind("<Unmap>", self._on_unmap)
 
     def _on_drop(self, event) -> None:
         paths = parse_drop_paths(event.data)
@@ -192,10 +265,23 @@ class App(TkinterDnD.Tk):
         self._convert_btn.configure(state="normal")
         self._status_label.config(text="", fg="#88cc88")
 
+        if self._auto_convert_var.get():
+            self._start_conversion()
+
     def _set_status(self, text: str, color: str = "#88cc88") -> None:
         """Update the status label. Must be called from the main thread only."""
         self._status_label.config(text=text, fg=color)
         self.update_idletasks()
+
+    def _save_settings(self) -> None:
+        smod.save({
+            "delete_flac": self._delete_var.get(),
+            "auto_convert": self._auto_convert_var.get(),
+            "minimize_to_tray": self._tray_var.get(),
+            "start_on_startup": self._startup_var.get(),
+            "monitor_enabled": self._monitor_var.get(),
+            "monitor_folder": self._monitor_folder_var.get() or None,
+        })
 
     def _start_conversion(self) -> None:
         if not check_ffmpeg():
@@ -254,3 +340,21 @@ class App(TkinterDnD.Tk):
                        f"Unexpected error: {e}", "#cc4444")
         finally:
             self.after(0, lambda: self._convert_btn.configure(state="normal"))
+
+    def _on_tray_toggle(self) -> None:
+        pass  # implemented in Task 6
+
+    def _on_startup_toggle(self) -> None:
+        pass  # implemented in Task 7
+
+    def _on_monitor_toggle(self) -> None:
+        pass  # implemented in Task 5
+
+    def _browse_monitor_folder(self) -> None:
+        pass  # implemented in Task 5
+
+    def _start_monitor(self, folder: str) -> None:
+        pass  # implemented in Task 5
+
+    def _on_unmap(self, event) -> None:
+        pass  # implemented in Task 6
