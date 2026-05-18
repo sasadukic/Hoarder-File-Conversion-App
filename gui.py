@@ -348,13 +348,66 @@ class App(TkinterDnD.Tk):
         pass  # implemented in Task 7
 
     def _on_monitor_toggle(self) -> None:
-        pass  # implemented in Task 5
+        folder = self._monitor_folder_var.get()
+        if self._monitor_var.get():
+            if not folder:
+                self._set_status("Select a folder to monitor first.", "#cc4444")
+                self._monitor_var.set(False)
+                return
+            self._start_monitor(folder)
+        else:
+            self._stop_monitor()
 
     def _browse_monitor_folder(self) -> None:
-        pass  # implemented in Task 5
+        folder = filedialog.askdirectory(title="Select folder to monitor")
+        if not folder:
+            return
+        self._monitor_folder_var.set(folder)
+        # If monitor checkbox is on, restart with new folder
+        if self._monitor_var.get():
+            self._stop_monitor()
+            self._start_monitor(folder)
 
     def _start_monitor(self, folder: str) -> None:
-        pass  # implemented in Task 5
+        self._stop_monitor()
+        self._monitor = mmod.FolderMonitor(folder, self._on_monitor_files)
+        try:
+            self._monitor.start()
+            self._set_status(f"Monitoring: {folder}", "#88cc88")
+        except Exception as e:
+            self._set_status(f"Monitor error: {e}", "#cc4444")
+            self._monitor_var.set(False)
+            self._monitor = None
+
+    def _stop_monitor(self) -> None:
+        if self._monitor is not None:
+            self._monitor.stop()
+            self._monitor = None
+
+    def _on_monitor_files(self, paths: List[str]) -> None:
+        """Called from watchdog thread — marshal to main thread."""
+        self.after(0, self._load_and_auto_convert, paths)
+
+    def _load_and_auto_convert(self, paths: List[str]) -> None:
+        """Load files from monitor and always start conversion.
+
+        _load_files may already trigger conversion when auto_convert is on.
+        Only call _start_conversion here when it hasn't been triggered yet.
+        """
+        self._load_files(paths)
+        # _load_files calls _start_conversion when auto_convert is on.
+        # When auto_convert is off we still want to convert (monitor always converts).
+        if self._mode is not None and not self._auto_convert_var.get():
+            self._start_conversion()
+
+    def destroy(self) -> None:
+        self._stop_monitor()
+        if self._tray_icon is not None:
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
+        super().destroy()
 
     def _on_unmap(self, event) -> None:
         pass  # implemented in Task 6
