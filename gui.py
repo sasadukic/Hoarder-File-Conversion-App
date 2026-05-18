@@ -90,6 +90,7 @@ class App(TkinterDnD.Tk):
         self._tray_icon = None
 
         self._build_ui()
+        self._check_stale_startup_shortcut()
 
     def _build_ui(self) -> None:
         s = self._settings
@@ -350,7 +351,75 @@ class App(TkinterDnD.Tk):
             self._restore_from_tray()
 
     def _on_startup_toggle(self) -> None:
-        pass  # implemented in Task 7
+        try:
+            if self._startup_var.get():
+                self._create_startup_shortcut()
+                self._set_status("Added to Windows startup.", "#88cc88")
+            else:
+                self._remove_startup_shortcut()
+                self._set_status("Removed from Windows startup.", "#88cc88")
+        except Exception as e:
+            self._set_status(f"Startup shortcut error: {e}", "#cc4444")
+            self._startup_var.set(not self._startup_var.get())  # revert
+
+    @staticmethod
+    def _startup_lnk_path() -> Path:
+        import os
+        startup = Path(os.environ["APPDATA"]) / \
+            "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+        return startup / "FLAC Converter.lnk"
+
+    @staticmethod
+    def _run_bat_path() -> Path:
+        return Path(__file__).parent / "run.bat"
+
+    def _create_startup_shortcut(self) -> None:
+        """Create a .lnk in the Windows Startup folder pointing to run.bat."""
+        import subprocess
+        lnk = str(self._startup_lnk_path())
+        target = str(self._run_bat_path().resolve())
+        ps = (
+            f'$s=(New-Object -COM WScript.Shell).CreateShortcut("{lnk}");'
+            f'$s.TargetPath="{target}";'
+            f'$s.Save()'
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "PowerShell error")
+
+    def _remove_startup_shortcut(self) -> None:
+        self._startup_lnk_path().unlink(missing_ok=True)
+
+    def _check_stale_startup_shortcut(self) -> None:
+        """Recreate startup shortcut if it exists but points to wrong path."""
+        if not self._startup_var.get():
+            return
+        lnk = self._startup_lnk_path()
+        if not lnk.exists():
+            # Checkbox says on but .lnk missing — try to recreate
+            try:
+                self._create_startup_shortcut()
+            except Exception:
+                pass
+            return
+        # Check if target matches current run.bat
+        import subprocess
+        target_expected = str(self._run_bat_path().resolve())
+        ps = f'(New-Object -COM WScript.Shell).CreateShortcut("{lnk}").TargetPath'
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            current_target = result.stdout.strip()
+            if current_target != target_expected:
+                try:
+                    self._create_startup_shortcut()
+                except Exception:
+                    pass
 
     def _on_monitor_toggle(self) -> None:
         folder = self._monitor_folder_var.get()
