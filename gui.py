@@ -189,17 +189,15 @@ class App(TkinterDnD.Tk):
         )
         self._drop_frame.place(x=16, y=12, width=468, height=76)
 
-        self._drop_label = tk.Label(
+        self._drop_canvas = tk.Canvas(
             self._drop_frame,
-            text="Drag & Drop",
             bg=PANEL,
-            fg=DIM,
-            font=("Silkscreen", 16),
-            justify="center",
+            highlightthickness=0,
+            cursor="hand2",
         )
-        self._drop_label.place(relx=0.5, rely=0.5, anchor="center")
+        self._drop_canvas.pack(fill="both", expand=True)
 
-        for widget in (self._drop_frame, self._drop_label):
+        for widget in (self._drop_frame, self._drop_canvas):
             widget.drop_target_register(DND_FILES)
             widget.dnd_bind("<<Drop>>", self._on_drop)
             widget.bind("<Button-1>", lambda e: self._browse())
