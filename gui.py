@@ -3,6 +3,7 @@ import io
 import tempfile
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 import wave
 import winsound
 from tkinter import filedialog
@@ -173,7 +174,6 @@ class App(TkinterDnD.Tk):
         self._wave_phase: float = 0.0
         self._wave_btn_text: str = "Convert"
         self._wave_btn_visible: bool = False
-        import tkinter.font as tkfont
         self._wave_font_drop = tkfont.Font(family="Silkscreen", size=16)
         self._wave_font_btn  = tkfont.Font(family="Silkscreen", size=28)
 
