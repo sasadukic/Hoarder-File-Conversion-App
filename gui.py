@@ -138,8 +138,10 @@ class App(TkinterDnD.Tk):
             font=("Segoe UI", 13, "bold"),
             state="disabled",
             command=self._start_conversion,
+            width=460,
+            height=45,
         )
-        self._convert_btn.place(x=20, y=295, width=460, height=45)
+        self._convert_btn.place(x=20, y=295)
 
         # Status line
         self._status_label = tk.Label(
