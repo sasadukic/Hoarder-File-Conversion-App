@@ -509,10 +509,19 @@ class App(TkinterDnD.Tk):
 
         def on_audio_progress(cur: int, total: int) -> None:
             completed[0] = cur
+            # Show current file name (cur is 1-indexed; use the FLAC paths list)
+            if flacs and 0 <= cur - 1 < len(flacs):
+                self.after(0, self._set_converting_file, flacs[cur - 1])
             pct = int(completed[0] / grand_total * 100)
             self.after(0, self._set_status, f"Conversion Running {pct}%")
 
-        def on_video_progress(cur: int, total: int) -> None:
+        _last_video_idx = [-1]
+
+        def on_video_progress(cur: float, total: int) -> None:
+            idx = min(int(cur), total - 1)
+            if idx != _last_video_idx[0] and 0 <= idx < len(videos):
+                _last_video_idx[0] = idx
+                self.after(0, self._set_converting_file, videos[idx])
             pct = int((audio_units + cur) / grand_total * 100)
             self.after(0, self._set_status, f"Conversion Running {pct}%")
 
@@ -531,18 +540,18 @@ class App(TkinterDnD.Tk):
             if videos:
                 transcode_videos(videos, on_video_progress, delete_source=do_delete)
 
-            # Done message
+            # Done
             self.after(0, self._play_done)
-            self.after(0, self._set_status, "Done.")
+            self.after(0, self._show_done)
             if do_delete:
                 self.after(3000, self._reset_ui)
 
         except ValueError as e:
-            self.after(0, self._set_status, f"Could not parse CUE file: {e}")
+            self.after(0, self._hide_wave_btn, f"Could not parse CUE file: {e}")
         except RuntimeError as e:
-            self.after(0, self._set_status, str(e))
+            self.after(0, self._hide_wave_btn, str(e))
         except Exception as e:
-            self.after(0, self._set_status, f"Unexpected error: {e}")
+            self.after(0, self._hide_wave_btn, f"Unexpected error: {e}")
         finally:
             self._is_converting = False
             self.after(0, lambda: self._convert_btn.configure(state="normal"))
