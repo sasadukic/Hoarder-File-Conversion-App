@@ -1,8 +1,5 @@
 import pytest
-from gui import detect_mode, parse_drop_paths
-
-MODE_SPLIT = "Split + Convert"
-MODE_CONVERT = "Convert Only"
+from gui import detect_mode, parse_drop_paths, MODE_SPLIT, MODE_CONVERT
 
 
 # --- detect_mode ---
@@ -46,7 +43,13 @@ def test_detect_mode_unsupported_file():
 def test_detect_mode_multiple_cues():
     mode, flacs, cue, err = detect_mode(["/m/a.flac", "/m/a.cue", "/m/b.cue"])
     assert mode is None
-    assert err is not None
+    assert "one CUE" in err or "CUE" in err
+
+
+def test_detect_mode_cue_with_multiple_flacs():
+    mode, flacs, cue, err = detect_mode(["/m/a.flac", "/m/b.flac", "/m/album.cue"])
+    assert mode is None
+    assert "one FLAC" in err or "CUE" in err
 
 
 # --- parse_drop_paths ---

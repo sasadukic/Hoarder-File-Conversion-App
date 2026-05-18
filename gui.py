@@ -37,6 +37,8 @@ def detect_mode(
         return None, [], None, "Only one CUE file is supported at a time"
     if len(cues) == 1 and len(flacs) == 1:
         return MODE_SPLIT, flacs, cues[0], None
+    if len(cues) == 1 and len(flacs) > 1:
+        return None, [], None, "CUE splitting requires exactly one FLAC file"
     if len(flacs) >= 1 and not cues:
         return MODE_CONVERT, flacs, None, None
     return None, [], None, "Invalid file selection"
@@ -189,6 +191,7 @@ class App(TkinterDnD.Tk):
         self._status_label.config(text="", fg="#88cc88")
 
     def _set_status(self, text: str, color: str = "#88cc88") -> None:
+        """Update the status label. Must be called from the main thread only."""
         self._status_label.config(text=text, fg=color)
         self.update_idletasks()
 
