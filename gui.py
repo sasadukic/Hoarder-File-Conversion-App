@@ -317,6 +317,14 @@ class App(TkinterDnD.Tk):
         )
         self._convert_btn.place(x=16, y=374)
 
+        # Button wave overlay (hidden until conversion starts)
+        self._wave_canvas_btn = tk.Canvas(
+            self,
+            bg=LIGHT,
+            highlightthickness=0,
+        )
+        # not placed yet — shown by _start_conversion
+
         # Settings traces
         for var in (
             self._delete_var, self._auto_convert_var,
@@ -331,6 +339,9 @@ class App(TkinterDnD.Tk):
         if s["monitor_folder"] and s["monitor_enabled"]:
             self._monitor_var.set(True)
             self._start_monitor(s["monitor_folder"])
+
+        # Start animation loop
+        self.after(40, self._wave_tick)
 
     # ------------------------------------------------------------------
     # Sound
@@ -568,7 +579,9 @@ class App(TkinterDnD.Tk):
         """Redraw the button-overlay canvas with waving status text."""
         c = self._wave_canvas_btn
         c.delete("all")
-        text = self._wave_btn_text
+        text = self._wave_btn_text or ""
+        if not text:
+            return
         w = c.winfo_width()
         h = c.winfo_height()
         if w < 2 or h < 2:
@@ -582,6 +595,14 @@ class App(TkinterDnD.Tk):
             c.create_text(x + cw / 2, y, text=ch,
                           font=self._wave_font_btn, fill=DARK, anchor="center")
             x += cw
+
+    def _wave_tick(self) -> None:
+        """Periodic animation tick — runs every 40 ms for the lifetime of the app."""
+        self._wave_phase += 0.25
+        self._draw_wave_drop()
+        if self._wave_btn_visible:
+            self._draw_wave_btn()
+        self.after(40, self._wave_tick)
 
     # ------------------------------------------------------------------
     # Tray
