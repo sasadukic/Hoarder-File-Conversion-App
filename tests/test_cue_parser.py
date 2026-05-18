@@ -1,6 +1,7 @@
 import pytest
 from cue_parser import _cue_time_to_seconds, _sanitize_filename, parse_cue
-import tempfile, os
+import os
+import tempfile
 
 
 def test_cue_time_basic():
@@ -93,5 +94,18 @@ def test_parse_cue_empty_raises():
     try:
         with pytest.raises(ValueError, match="No tracks found"):
             parse_cue(path)
+    finally:
+        os.unlink(path)
+
+
+def test_parse_cue_cp1252_encoding():
+    # Simulate a CUE file saved with Latin-1/cp1252 encoding (common from Windows CD rippers)
+    cue_content = 'FILE "album.flac" WAVE\n  TRACK 01 AUDIO\n    TITLE "Caf\xe9"\n    INDEX 01 00:00:00\n'
+    with tempfile.NamedTemporaryFile(mode='wb', suffix='.cue', delete=False) as f:
+        f.write(cue_content.encode('cp1252'))
+        path = f.name
+    try:
+        tracks = parse_cue(path)
+        assert tracks[0].title == "Caf\xe9"
     finally:
         os.unlink(path)

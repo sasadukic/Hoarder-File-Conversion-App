@@ -1,3 +1,4 @@
+import dataclasses
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,13 +64,7 @@ def parse_cue(cue_path: str) -> List[Track]:
             start = _cue_time_to_seconds(m.group(1))
             # Set end time on the previous track
             if tracks:
-                prev = tracks[-1]
-                tracks[-1] = Track(
-                    number=prev.number,
-                    title=prev.title,
-                    start=prev.start,
-                    end=start,
-                )
+                tracks[-1] = dataclasses.replace(tracks[-1], end=start)
             tracks.append(Track(
                 number=current_num,
                 title=current_title or f"Track {current_num:02d}",
