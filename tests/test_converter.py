@@ -1,7 +1,8 @@
 import pytest
 from unittest.mock import patch, MagicMock, call
 from pathlib import Path
-import tempfile, os
+import os
+import tempfile
 
 from converter import check_ffmpeg, split_and_convert, convert_files, delete_flacs
 from cue_parser import Track

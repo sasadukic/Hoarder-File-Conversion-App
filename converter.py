@@ -6,6 +6,13 @@ from typing import Callable, List, Optional
 from cue_parser import Track
 
 
+def _run_ffmpeg(cmd: List[str], error_prefix: str) -> None:
+    """Run an ffmpeg command. Raises RuntimeError with error_prefix on failure."""
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"{error_prefix}: {result.stderr.strip()}")
+
+
 def check_ffmpeg() -> bool:
     """Return True if ffmpeg is available on PATH."""
     return shutil.which("ffmpeg") is not None
@@ -34,9 +41,7 @@ def split_and_convert(
             cmd += ["-to", str(track.end)]
         cmd += ["-i", str(flac), "-b:a", "320k", str(out)]
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Error on track {i}: {result.stderr.strip()}")
+        _run_ffmpeg(cmd, f"Error on track {i}")
 
 
 def convert_files(
@@ -56,11 +61,7 @@ def convert_files(
         out = flac.parent / (flac.stem + ".mp3")
 
         cmd = ["ffmpeg", "-y", "-i", str(flac), "-b:a", "320k", str(out)]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Error on file {i} ({flac.name}): {result.stderr.strip()}"
-            )
+        _run_ffmpeg(cmd, f"Error on file {i} ({flac.name})")
 
 
 def delete_flacs(flac_paths: List[str]) -> Optional[str]:
