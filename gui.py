@@ -1,5 +1,6 @@
 import array
 import io
+import math
 import tempfile
 import threading
 import tkinter as tk
@@ -543,6 +544,44 @@ class App(TkinterDnD.Tk):
         self._video_paths = []
         self._info_label.config(text="No files loaded", fg=DIM)
         self._convert_btn.configure(state="disabled", text="Convert")
+
+    def _draw_wave_drop(self) -> None:
+        """Redraw the drop-zone canvas with a waving 'Drag & Drop' text."""
+        c = self._drop_canvas
+        c.delete("all")
+        text = "Drag & Drop"
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w < 2 or h < 2:
+            return  # canvas not yet realized
+        total_w = sum(self._wave_font_drop.measure(ch) for ch in text)
+        x = (w - total_w) / 2
+        cy = h / 2
+        for i, ch in enumerate(text):
+            cw = self._wave_font_drop.measure(ch)
+            y = cy + 4 * math.sin(self._wave_phase + i * 0.6)
+            c.create_text(x + cw / 2, y, text=ch,
+                          font=self._wave_font_drop, fill=DIM, anchor="center")
+            x += cw
+
+    def _draw_wave_btn(self) -> None:
+        """Redraw the button-overlay canvas with waving status text."""
+        c = self._wave_canvas_btn
+        c.delete("all")
+        text = self._wave_btn_text
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w < 2 or h < 2:
+            return
+        total_w = sum(self._wave_font_btn.measure(ch) for ch in text)
+        x = (w - total_w) / 2
+        cy = h / 2
+        for i, ch in enumerate(text):
+            cw = self._wave_font_btn.measure(ch)
+            y = cy + 5 * math.sin(self._wave_phase + i * 0.6)
+            c.create_text(x + cw / 2, y, text=ch,
+                          font=self._wave_font_btn, fill=DARK, anchor="center")
+            x += cw
 
     # ------------------------------------------------------------------
     # Tray
