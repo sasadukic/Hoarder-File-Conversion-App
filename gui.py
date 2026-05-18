@@ -4,6 +4,9 @@ from tkinter import filedialog
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import pystray
+from PIL import Image, ImageDraw
+
 import customtkinter as ctk
 from tkinterdnd2 import TkinterDnD, DND_FILES
 
@@ -342,7 +345,9 @@ class App(TkinterDnD.Tk):
             self.after(0, lambda: self._convert_btn.configure(state="normal"))
 
     def _on_tray_toggle(self) -> None:
-        pass  # implemented in Task 6
+        """If tray is unchecked while window is hidden, restore immediately."""
+        if not self._tray_var.get() and self._tray_icon is not None:
+            self._restore_from_tray()
 
     def _on_startup_toggle(self) -> None:
         pass  # implemented in Task 7
@@ -410,4 +415,48 @@ class App(TkinterDnD.Tk):
         super().destroy()
 
     def _on_unmap(self, event) -> None:
-        pass  # implemented in Task 6
+        """Called when window is minimized (or hidden). Route to tray if enabled."""
+        if event.widget is not self:
+            return
+        if self._hiding_to_tray:
+            return
+        if not self._tray_var.get():
+            return
+        self._hiding_to_tray = True
+        try:
+            self._tray_icon = self._build_tray_icon()
+            self.withdraw()
+            self._tray_icon.run_detached()
+        except Exception as e:
+            self._tray_var.set(False)
+            self._set_status(f"Tray error: {e}", "#cc4444")
+        finally:
+            self._hiding_to_tray = False
+
+    def _build_tray_icon(self) -> pystray.Icon:
+        """Create a 64x64 tray icon with 'F→M' text."""
+        img = Image.new("RGBA", (64, 64), (30, 30, 30, 255))
+        draw = ImageDraw.Draw(img)
+        draw.text((8, 20), "F\u2192M", fill=(200, 200, 200, 255))
+        menu = pystray.Menu(
+            pystray.MenuItem("Open", self._tray_open, default=True),
+            pystray.MenuItem("Quit", self._tray_quit),
+        )
+        return pystray.Icon("FLAC Converter", img, "FLAC Converter", menu)
+
+    def _tray_open(self, icon=None, item=None) -> None:
+        self.after(0, self._restore_from_tray)
+
+    def _tray_quit(self, icon=None, item=None) -> None:
+        if self._tray_icon is not None:
+            self._tray_icon.stop()
+            self._tray_icon = None
+        self.after(0, self.destroy)
+
+    def _restore_from_tray(self) -> None:
+        if self._tray_icon is not None:
+            self._tray_icon.stop()
+            self._tray_icon = None
+        self.deiconify()
+        self.lift()
+        self.focus_force()
