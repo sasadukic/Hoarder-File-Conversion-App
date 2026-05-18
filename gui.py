@@ -445,8 +445,10 @@ class App(TkinterDnD.Tk):
     # Status / settings
     # ------------------------------------------------------------------
     def _set_status(self, text: str, color: str = GREEN) -> None:
-        """Update the convert button text with a status message."""
-        self._convert_btn.configure(text=text)
+        """Update the convert button text (or wave canvas text during conversion)."""
+        self._wave_btn_text = text
+        if not self._wave_btn_visible:
+            self._convert_btn.configure(text=text)
         self.update_idletasks()
 
     def _save_settings(self) -> None:
@@ -474,8 +476,10 @@ class App(TkinterDnD.Tk):
             return
 
         self._is_converting = True
-        self._convert_btn.configure(state="disabled")
-        self._set_status("Conversion Running", SAGE)
+        self._convert_btn.configure(state="disabled", text="")
+        self._wave_btn_text = "Conversion Running"
+        self._wave_btn_visible = True
+        self._wave_canvas_btn.place(x=16, y=374, width=468, height=56)
 
         thread = threading.Thread(target=self._run_conversion, daemon=True)
         thread.start()
@@ -603,6 +607,25 @@ class App(TkinterDnD.Tk):
         if self._wave_btn_visible:
             self._draw_wave_btn()
         self.after(40, self._wave_tick)
+
+    def _hide_wave_btn(self, text: str) -> None:
+        """Stop the button wave overlay and restore normal button text."""
+        self._wave_btn_visible = False
+        self._wave_canvas_btn.place_forget()
+        self._convert_btn.configure(text=text)
+
+    def _set_converting_file(self, path: str) -> None:
+        """Show the currently converting file name in the info label."""
+        self._info_label.config(text=Path(path).name, fg=SAGE)
+
+    def _show_done(self) -> None:
+        """Called on successful conversion completion."""
+        self._hide_wave_btn("Done.")
+        has_files = bool(self._flac_paths or self._video_paths)
+        self._info_label.config(
+            text="Files Loaded" if has_files else "No files loaded",
+            fg=SAGE if has_files else DIM,
+        )
 
     # ------------------------------------------------------------------
     # Tray
