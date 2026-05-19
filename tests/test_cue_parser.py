@@ -1,5 +1,5 @@
 import pytest
-from cue_parser import _cue_time_to_seconds, _sanitize_filename, parse_cue
+from cue_parser import _cue_time_to_seconds, _sanitize_filename, parse_cue, cue_file_ref
 import os
 import tempfile
 
@@ -107,5 +107,59 @@ def test_parse_cue_cp1252_encoding():
     try:
         tracks = parse_cue(path)
         assert tracks[0].title == "Caf\xe9"
+    finally:
+        os.unlink(path)
+
+
+# --- cue_file_ref ---
+
+def test_cue_file_ref_returns_filename():
+    cue_content = 'FILE "album.flac" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n'
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.cue',
+                                     delete=False, encoding='utf-8') as f:
+        f.write(cue_content)
+        path = f.name
+    try:
+        assert cue_file_ref(path) == "album.flac"
+    finally:
+        os.unlink(path)
+
+
+def test_cue_file_ref_no_file_directive():
+    cue_content = '  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n'
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.cue',
+                                     delete=False, encoding='utf-8') as f:
+        f.write(cue_content)
+        path = f.name
+    try:
+        assert cue_file_ref(path) is None
+    finally:
+        os.unlink(path)
+
+
+def test_cue_file_ref_missing_file_returns_none():
+    assert cue_file_ref("/nonexistent/path.cue") is None
+
+
+def test_cue_file_ref_case_insensitive_keyword():
+    cue_content = 'file "disc1.flac" WAVE\n'
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.cue',
+                                     delete=False, encoding='utf-8') as f:
+        f.write(cue_content)
+        path = f.name
+    try:
+        assert cue_file_ref(path) == "disc1.flac"
+    finally:
+        os.unlink(path)
+
+
+def test_cue_file_ref_first_file_directive_wins():
+    cue_content = 'FILE "cd1.flac" WAVE\nFILE "cd2.flac" WAVE\n'
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.cue',
+                                     delete=False, encoding='utf-8') as f:
+        f.write(cue_content)
+        path = f.name
+    try:
+        assert cue_file_ref(path) == "cd1.flac"
     finally:
         os.unlink(path)

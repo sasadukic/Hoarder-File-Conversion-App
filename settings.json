@@ -1,0 +1,8 @@
+{
+  "delete_flac": true,
+  "auto_convert": true,
+  "minimize_to_tray": true,
+  "start_on_startup": false,
+  "monitor_enabled": false,
+  "monitor_folder": null
+}

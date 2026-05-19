@@ -29,6 +29,28 @@ def _sanitize_filename(title: str) -> str:
     return title.strip()
 
 
+def cue_file_ref(cue_path: str) -> Optional[str]:
+    """Return the filename referenced by the first FILE directive in a CUE file.
+
+    CUE FILE lines look like:  FILE "filename.flac" WAVE
+    Returns None if no FILE directive is found or the file cannot be read.
+    """
+    path = Path(cue_path)
+    try:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            content = path.read_text(encoding="cp1252")
+    except OSError:
+        return None
+
+    for line in content.splitlines():
+        m = re.match(r'FILE\s+"(.+)"\s+\w+', line.strip(), re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
 def parse_cue(cue_path: str) -> List[Track]:
     """Parse a CUE file and return a list of Track objects.
 

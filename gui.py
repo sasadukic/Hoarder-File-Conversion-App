@@ -1,6 +1,7 @@
 import array
 import io
 import math
+import sys
 import tempfile
 import threading
 import tkinter as tk
@@ -17,8 +18,11 @@ from PIL import Image, ImageDraw
 import customtkinter as ctk
 from tkinterdnd2 import TkinterDnD, DND_FILES
 
-from cue_parser import parse_cue
-from converter import check_ffmpeg, split_and_convert, convert_files, delete_flacs, transcode_videos
+from cue_parser import parse_cue, cue_file_ref
+from converter import (
+    AUDIO_EXTS, check_ffmpeg, split_and_convert, convert_files,
+    delete_flacs, delete_companion_files, transcode_videos,
+)
 import settings as smod
 import monitor as mmod
 
@@ -54,12 +58,12 @@ def detect_mode(
     Returns (mode, flac_paths, cue_path, video_paths, error_message).
     On error, mode is None and error_message is set.
     """
-    flacs  = [p for p in paths if p.lower().endswith(".flac")]
+    flacs  = [p for p in paths if Path(p).suffix.lower() in AUDIO_EXTS]
     cues   = [p for p in paths if p.lower().endswith(".cue")]
     videos = [p for p in paths if Path(p).suffix.lower() in VIDEO_EXTS]
     others = [
         p for p in paths
-        if not p.lower().endswith(".flac")
+        if Path(p).suffix.lower() not in AUDIO_EXTS
         and not p.lower().endswith(".cue")
         and Path(p).suffix.lower() not in VIDEO_EXTS
     ]
@@ -67,7 +71,7 @@ def detect_mode(
     if others:
         return None, [], None, [], "Unsupported file type"
     if cues and not flacs and not videos:
-        return None, [], None, [], "Please also provide a FLAC file"
+        return None, [], None, [], "Please also provide an audio file"
     if len(cues) > 1:
         return None, [], None, [], "Only one CUE file is supported at a time"
 
@@ -118,16 +122,21 @@ def parse_drop_paths(data: str) -> List[str]:
 
 
 def expand_drops(paths: List[str]) -> List[str]:
-    """Expand any dropped folders into their contained FLAC, CUE, and video files."""
+    """Expand any dropped folders into their contained audio, CUE, and video files.
+
+    Searches recursively so dropping a discography/parent folder picks up files
+    in all sub-albums.
+    """
     _video_globs = ("*.mp4", "*.mkv", "*.mov", "*.wmv", "*.avi")
     result = []
     for p in paths:
         path = Path(p)
         if path.is_dir():
-            result.extend(str(f) for f in sorted(path.glob("*.flac")))
-            result.extend(str(f) for f in sorted(path.glob("*.cue")))
+            for ext in sorted(AUDIO_EXTS):
+                result.extend(str(f) for f in sorted(path.rglob(f"*{ext}")))
+            result.extend(str(f) for f in sorted(path.rglob("*.cue")))
             for pat in _video_globs:
-                result.extend(str(f) for f in sorted(path.glob(pat)))
+                result.extend(str(f) for f in sorted(path.rglob(pat)))
         else:
             result.append(p)
     return result
@@ -162,6 +171,7 @@ class App(TkinterDnD.Tk):
         self._hiding_to_tray = False
         self._tray_icon = None
         self._is_converting = False
+        self._conversion_queue: List[List[str]] = []
 
         self._preload_sounds()
         self._build_ui()
@@ -171,12 +181,9 @@ class App(TkinterDnD.Tk):
     def _build_ui(self) -> None:
         s = self._settings
 
-        # Wave animation state
+        # Wave animation state (drop zone only)
         self._wave_phase: float = 0.0
-        self._wave_btn_text: str = "Convert"
-        self._wave_btn_visible: bool = False
         self._wave_font_drop = tkfont.Font(family="Silkscreen", size=16)
-        self._wave_font_btn  = tkfont.Font(family="Silkscreen", size=28)
 
         # ------------------------------------------------------------------
         # Drop zone
@@ -204,19 +211,16 @@ class App(TkinterDnD.Tk):
             widget.bind("<Button-1>", lambda e: self._browse())
 
         # ------------------------------------------------------------------
-        # File info
+        # File info (canvas so long filenames can marquee-scroll)
         # ------------------------------------------------------------------
-        self._info_label = tk.Label(
-            self,
-            text="No files loaded",
-            bg=BG,
-            fg=DIM,
-            font=("Silkscreen", 16),
-            wraplength=468,
-            justify="left",
-            anchor="w",
-        )
-        self._info_label.place(x=16, y=98, width=468, height=36)
+        self._scroll_text: str = ""
+        self._scroll_color: str = DIM
+        self._scroll_x: float = 0.0
+        self._scroll_active: bool = False
+
+        self._info_canvas = tk.Canvas(self, bg=BG, highlightthickness=0)
+        self._info_canvas.place(x=16, y=98, width=468, height=36)
+        self._set_info("No files loaded", DIM)
 
         # ------------------------------------------------------------------
         # Checkboxes
@@ -317,13 +321,7 @@ class App(TkinterDnD.Tk):
         )
         self._convert_btn.place(x=16, y=374)
 
-        # Button wave overlay (hidden until conversion starts)
-        self._wave_canvas_btn = tk.Canvas(
-            self,
-            bg=LIGHT,
-            highlightthickness=0,
-        )
-        # not placed yet — shown by _start_conversion
+        # Button wave overlay removed — button shows plain text during conversion
 
         # Settings traces
         for var in (
@@ -404,24 +402,61 @@ class App(TkinterDnD.Tk):
 
     def _on_drop(self, event) -> None:
         paths = expand_drops(parse_drop_paths(event.data))
-        self._load_files(paths)
+        self._handle_paths(paths)
 
     def _browse(self) -> None:
         self._play_click()
         paths = filedialog.askopenfilenames(
-            title="Select FLAC and/or CUE files",
+            title="Select audio and/or CUE files",
             filetypes=[
-                ("Audio/CUE files", "*.flac *.cue"),
+                ("Audio/CUE files",
+                 "*.flac *.alac *.m4a *.ape *.aiff *.aif *.dsf *.dff *.wma *.cue"),
                 ("All files", "*.*"),
             ],
         )
         if paths:
-            self._load_files(list(paths))
+            self._handle_paths(list(paths))
+
+    def _handle_paths(self, paths: List[str]) -> None:
+        """Route a list of dropped or browsed paths to conversion.
+
+        For single-disc drops (0 or 1 CUE), delegates straight to _load_files
+        so the user sees the files immediately and can click Convert manually.
+
+        For multi-disc drops (2+ CUE files), splits into per-disc batches and
+        enqueues them so they run sequentially without blocking the UI.
+        """
+        flacs = [p for p in paths if Path(p).suffix.lower() in AUDIO_EXTS]
+        cues = [p for p in paths if p.lower().endswith(".cue")]
+        videos = [p for p in paths if Path(p).suffix.lower() in VIDEO_EXTS]
+
+        if len(cues) <= 1:
+            # Standard path — let detect_mode decide; show result in UI
+            self._load_files(paths)
+            return
+
+        # Multi-disc: pair each CUE with its FLAC, enqueue per-disc
+        cue_paths = [Path(c) for c in cues]
+        flac_paths = [Path(f) for f in flacs]
+        pairs = self._pair_cues_flacs(cue_paths, flac_paths)
+        paired_flac_strs = {str(flac) for flac, _ in pairs}
+
+        for flac, cue in pairs:
+            self._enqueue_conversion([str(flac), str(cue)])
+
+        # Remaining unpaired FLACs batched together
+        lone = [f for f in flacs if f not in paired_flac_strs]
+        if lone:
+            self._enqueue_conversion(lone)
+
+        # Videos (rare with multi-disc audio, but handle gracefully)
+        if videos:
+            self._enqueue_conversion(videos)
 
     def _load_files(self, paths: List[str]) -> None:
         mode, flacs, cue, videos, error = detect_mode(paths)
         if error:
-            self._info_label.config(text=error, fg=WARM)
+            self._set_info(error, WARM)
             self._convert_btn.configure(state="disabled")
             self._flac_paths = []
             self._cue_path = None
@@ -435,7 +470,7 @@ class App(TkinterDnD.Tk):
         self._video_paths = videos
 
         names = ", ".join(Path(p).name for p in paths)  # noqa: F841
-        self._info_label.config(text="Files loaded", fg=SAGE)
+        self._set_info("Files loaded", SAGE)
         self._convert_btn.configure(state="normal", text="Convert")
 
         if self._auto_convert_var.get():
@@ -445,10 +480,8 @@ class App(TkinterDnD.Tk):
     # Status / settings
     # ------------------------------------------------------------------
     def _set_status(self, text: str, color: str = GREEN) -> None:
-        """Update the convert button text (or wave canvas text during conversion)."""
-        self._wave_btn_text = text
-        if not self._wave_btn_visible:
-            self._convert_btn.configure(text=text)
+        """Update the convert button text."""
+        self._convert_btn.configure(text=text)
         self.update_idletasks()
 
     def _save_settings(self) -> None:
@@ -476,10 +509,7 @@ class App(TkinterDnD.Tk):
             return
 
         self._is_converting = True
-        self._convert_btn.configure(state="disabled", text="")
-        self._wave_btn_text = "Conversion Running"
-        self._wave_btn_visible = True
-        self._wave_canvas_btn.place(x=16, y=374, width=468, height=56)
+        self._convert_btn.configure(state="disabled", text="Converting...")
 
         thread = threading.Thread(target=self._run_conversion, daemon=True)
         thread.start()
@@ -535,6 +565,7 @@ class App(TkinterDnD.Tk):
                     convert_files(flacs, on_audio_progress)
                 if do_delete:
                     delete_flacs(flacs)
+                    delete_companion_files(flacs, cue)
 
             # --- Video ---
             if videos:
@@ -555,18 +586,25 @@ class App(TkinterDnD.Tk):
         finally:
             self._is_converting = False
             self.after(0, lambda: self._convert_btn.configure(state="normal"))
+            self.after(0, self._process_next_queue_item)
 
     def _reset_btn_text(self) -> None:
         """Restore button text to Convert without touching file state."""
         self._convert_btn.configure(text="Convert")
 
     def _reset_ui(self) -> None:
-        """Reset the UI to idle state after a completed conversion."""
+        """Reset the UI to idle state after a completed conversion.
+
+        Guarded: does nothing if another conversion is in progress or the
+        queue still has items waiting (e.g. disc 2 of a multi-disc set).
+        """
+        if self._is_converting or self._conversion_queue:
+            return
         self._flac_paths = []
         self._cue_path = None
         self._mode = None
         self._video_paths = []
-        self._info_label.config(text="No files loaded", fg=DIM)
+        self._set_info("No files loaded", DIM)
         self._convert_btn.configure(state="disabled", text="Convert")
 
     def _draw_wave_drop(self) -> None:
@@ -588,53 +626,84 @@ class App(TkinterDnD.Tk):
                           font=self._wave_font_drop, fill=DIM, anchor="center")
             x += cw
 
-    def _draw_wave_btn(self) -> None:
-        """Redraw the button-overlay canvas with waving status text."""
-        c = self._wave_canvas_btn
-        c.delete("all")
-        text = self._wave_btn_text or ""
-        if not text:
-            return
-        w = c.winfo_width()
-        h = c.winfo_height()
-        if w < 2 or h < 2:
-            return
-        total_w = sum(self._wave_font_btn.measure(ch) for ch in text)
-        x = (w - total_w) / 2
-        cy = h / 2
-        for i, ch in enumerate(text):
-            cw = self._wave_font_btn.measure(ch)
-            y = cy + 5 * math.sin(self._wave_phase + i * 0.6)
-            c.create_text(x + cw / 2, y, text=ch,
-                          font=self._wave_font_btn, fill=DARK, anchor="center")
-            x += cw
-
     def _wave_tick(self) -> None:
         """Periodic animation tick — runs every 40 ms for the lifetime of the app."""
         self._wave_phase += 0.25
         self._draw_wave_drop()
-        if self._wave_btn_visible:
-            self._draw_wave_btn()
         self.after(40, self._wave_tick)
 
     def _hide_wave_btn(self, text: str) -> None:
-        """Stop the button wave overlay and restore normal button text."""
-        self._wave_btn_visible = False
-        self._wave_canvas_btn.place_forget()
+        """Restore normal button text after conversion and freeze any info scroll."""
         self._convert_btn.configure(text=text)
+        # Stop marquee and show the last filename as static text
+        if self._scroll_active and self._scroll_text:
+            self._set_info(self._scroll_text, self._scroll_color)
+
+    def _set_info(self, text: str, color: str) -> None:
+        """Draw static text in the info area and stop any active scroll."""
+        self._scroll_active = False
+        c = self._info_canvas
+        c.delete("all")
+        c.create_text(4, 18, text=text, font=self._wave_font_drop,
+                      fill=color, anchor="w")
+
+    def _start_scroll(self, text: str, color: str) -> None:
+        """Scroll text left in the info area; falls back to static if it fits.
+
+        Uses a dual threshold so long filenames always scroll even when the
+        Silkscreen font fails to register in the bundled exe and tkinter
+        substitutes a narrower fallback (which would otherwise give a false
+        'it fits' measurement).
+        """
+        font = self._wave_font_drop
+        # Scroll if the text is measurably wide OR simply has many characters.
+        # The character-count guard catches the font-substitution case where
+        # font.measure() under-reports width.
+        if font.measure(text) <= 440 and len(text) <= 35:
+            self._set_info(text, color)
+            return
+        was_active = self._scroll_active
+        self._scroll_active = True
+        self._scroll_text = text
+        self._scroll_color = color
+        self._scroll_x = 0.0                  # start with text flush to left edge
+        if not was_active:
+            self._scroll_tick()               # kick off the loop only once
+
+    def _scroll_tick(self) -> None:
+        """Advance the info-area marquee by one step (self-scheduling, 40 ms)."""
+        if not self._scroll_active:
+            return
+        font = self._wave_font_drop
+        text = self._scroll_text
+        color = self._scroll_color
+        text_w = font.measure(text)
+        gap = 48                              # pixel gap before the repeated copy
+
+        self._scroll_x -= 1.5
+        if self._scroll_x <= -(text_w + gap):
+            self._scroll_x = 0.0             # seamless loop: reset to start
+
+        c = self._info_canvas
+        c.delete("all")
+        x = self._scroll_x + 4
+        # primary instance
+        c.create_text(x, 18, text=text, font=font, fill=color, anchor="w")
+        # lookahead copy so the repeat appears before the primary exits
+        c.create_text(x + text_w + gap, 18, text=text, font=font,
+                      fill=color, anchor="w")
+        self.after(40, self._scroll_tick)
 
     def _set_converting_file(self, path: str) -> None:
-        """Show the currently converting file name in the info label."""
-        self._info_label.config(text=Path(path).name, fg=SAGE)
+        """Scroll (or show) the currently converting file name in the info area."""
+        self._start_scroll(Path(path).name, SAGE)
 
     def _show_done(self) -> None:
         """Called on successful conversion completion."""
         self._hide_wave_btn("Done.")
-        has_files = bool(self._flac_paths or self._video_paths)
-        self._info_label.config(
-            text="Files Loaded" if has_files else "No files loaded",
-            fg=SAGE if has_files else DIM,
-        )
+        # Leave the info label showing the last converted filename so the user
+        # can see what was processed. _reset_ui (auto-called 3 s later when
+        # delete_flac is on, or on next file load) will clear it.
 
     # ------------------------------------------------------------------
     # Tray
@@ -725,6 +794,10 @@ class App(TkinterDnD.Tk):
 
     @staticmethod
     def _run_bat_path() -> Path:
+        # When running as a PyInstaller bundle, point the startup shortcut at
+        # the exe itself rather than the dev-only run.vbs script.
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable)
         return Path(__file__).parent / "run.vbs"
 
     def _create_startup_shortcut(self) -> None:
@@ -818,28 +891,114 @@ class App(TkinterDnD.Tk):
             self._monitor = None
 
     def _scan_existing_files(self, folder: str) -> None:
-        """Trigger conversion for FLAC and video files already in the monitored folder."""
+        """Queue conversion jobs for all audio and video files in the monitored folder.
+
+        Files are grouped by parent directory so each subfolder becomes its own
+        job and all jobs run sequentially via _conversion_queue.
+        """
         folder_path = Path(folder)
 
-        # --- Audio ---
-        all_flacs = sorted(folder_path.rglob("*.flac"))
-        paired: set[Path] = set()
-        for flac in all_flacs:
-            cue = flac.with_suffix(".cue")
-            if cue.exists():
-                self.after(0, self._load_and_auto_convert, [str(flac), str(cue)])
-                paired.add(flac)
-        lone_audio = [str(f) for f in all_flacs if f not in paired]
-        if lone_audio:
-            self.after(0, self._load_and_auto_convert, lone_audio)
+        # --- Audio: collect all supported formats, group by parent directory ---
+        audio_by_dir: dict[Path, list[Path]] = {}
+        for ext in AUDIO_EXTS:
+            for audio in sorted(folder_path.rglob(f"*{ext}")):
+                audio_by_dir.setdefault(audio.parent, []).append(audio)
+        for d in audio_by_dir:
+            audio_by_dir[d].sort()
 
-        # --- Video ---
-        video_exts = ("*.mp4", "*.mkv", "*.mov", "*.wmv", "*.avi")
-        all_videos: list[Path] = []
-        for pat in video_exts:
-            all_videos.extend(sorted(folder_path.rglob(pat)))
-        if all_videos:
-            self.after(0, self._load_and_auto_convert, [str(v) for v in all_videos])
+        for dir_path, dir_audio in sorted(audio_by_dir.items()):
+            cue_files = sorted(dir_path.glob("*.cue"))
+            if not cue_files:
+                # No CUEs — batch all audio files together
+                self.after(0, self._enqueue_conversion,
+                           [str(f) for f in dir_audio])
+            else:
+                # Pair CUEs with audio via stem-match + FILE directive fallback
+                pairs = self._pair_cues_flacs(cue_files, dir_audio)
+                paired_audio_set = {audio for audio, _ in pairs}
+                for audio, cue in pairs:
+                    self.after(0, self._enqueue_conversion,
+                               [str(audio), str(cue)])
+                lone = [str(f) for f in dir_audio if f not in paired_audio_set]
+                if lone:
+                    self.after(0, self._enqueue_conversion, lone)
+
+        # --- Video: group by parent directory ---
+        videos_by_dir: dict[Path, list[str]] = {}
+        for pat in ("*.mp4", "*.mkv", "*.mov", "*.wmv", "*.avi"):
+            for vid in sorted(folder_path.rglob(pat)):
+                videos_by_dir.setdefault(vid.parent, []).append(str(vid))
+        for dir_path in sorted(videos_by_dir):
+            self.after(0, self._enqueue_conversion, videos_by_dir[dir_path])
+
+    @staticmethod
+    def _pair_cues_flacs(
+        cue_paths: List[Path], flac_paths: List[Path]
+    ) -> List[Tuple[Path, Path]]:
+        """Pair CUE files with audio files, returning a list of (audio, cue) tuples.
+
+        Matching strategy (in order):
+        1. Stem match — ``album.cue`` pairs with ``album.flac`` / ``album.ape`` etc.
+        2. FILE directive fallback — reads the ``FILE "..."`` line from the CUE
+           and matches its stem against the available audio files.
+
+        Each audio file and CUE is used at most once.
+        """
+        flac_by_stem: Dict[str, Path] = {f.stem.lower(): f for f in flac_paths}
+        used_flacs: set[str] = set()
+        pairs: List[Tuple[Path, Path]] = []
+        unmatched_cues: List[Path] = []
+
+        # Pass 1: stem match
+        for cue in cue_paths:
+            key = cue.stem.lower()
+            flac = flac_by_stem.get(key)
+            if flac is not None and key not in used_flacs:
+                pairs.append((flac, cue))
+                used_flacs.add(key)
+            else:
+                unmatched_cues.append(cue)
+
+        # Pass 2: FILE directive fallback for unmatched CUEs
+        for cue in unmatched_cues:
+            ref = cue_file_ref(str(cue))
+            if ref:
+                ref_stem = Path(ref).stem.lower()
+                flac = flac_by_stem.get(ref_stem)
+                if flac is not None and ref_stem not in used_flacs:
+                    pairs.append((flac, cue))
+                    used_flacs.add(ref_stem)
+
+        return pairs
+
+    def _enqueue_conversion(self, paths: List[str]) -> None:
+        """Validate *paths* and add them to the conversion queue.
+
+        Silently ignores batches that detect_mode rejects (e.g. unsupported
+        types arriving from the file-system watcher).  If nothing is currently
+        converting, starts processing immediately.
+        """
+        _, _, _, _, error = detect_mode(paths)
+        if error:
+            return
+        self._conversion_queue.append(paths)
+        self._process_next_queue_item()
+
+    def _process_next_queue_item(self) -> None:
+        """Pop and start the next batch from the queue if the app is idle.
+
+        Called both when a new item is enqueued and at the end of every
+        conversion (via the finally block in _run_conversion).
+        """
+        if self._is_converting or not self._conversion_queue:
+            return
+        paths = self._conversion_queue.pop(0)
+        self._load_files(paths)
+        # Start even when auto_convert is off (monitor items always convert).
+        # If _load_files already started it (auto_convert=True) this is a no-op
+        # because _is_converting will already be True.
+        if self._mode is not None and not self._is_converting:
+            self._start_conversion()
 
     def _stop_monitor(self) -> None:
         if self._monitor is not None:
@@ -847,14 +1006,12 @@ class App(TkinterDnD.Tk):
             self._monitor = None
 
     def _on_monitor_files(self, paths: List[str]) -> None:
-        """Called from watchdog thread — marshal to main thread."""
-        self.after(0, self._load_and_auto_convert, paths)
+        """Called from watchdog thread when new files arrive - marshal to main thread."""
+        self.after(0, self._enqueue_conversion, paths)
 
     def _load_and_auto_convert(self, paths: List[str]) -> None:
-        """Load files from monitor and always start conversion."""
-        self._load_files(paths)
-        if self._mode is not None and not self._auto_convert_var.get():
-            self._start_conversion()
+        """Queue files for conversion (kept for compatibility; delegates to queue)."""
+        self._enqueue_conversion(paths)
 
     # ------------------------------------------------------------------
     # Cleanup

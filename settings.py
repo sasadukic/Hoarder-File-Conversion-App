@@ -1,8 +1,18 @@
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
-_SETTINGS_PATH = Path(__file__).parent / "settings.json"
+
+def _settings_path() -> Path:
+    # When running as a PyInstaller bundle, save settings next to the exe so
+    # they persist across runs and travel with the portable folder.
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent / "settings.json"
+    return Path(__file__).parent / "settings.json"
+
+
+_SETTINGS_PATH = _settings_path()
 
 _DEFAULTS: Dict[str, Any] = {
     "delete_flac": False,

@@ -6,6 +6,9 @@ from typing import Callable, List, Set
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
+from cue_parser import cue_file_ref
+from converter import AUDIO_EXTS as _AUDIO_EXTS
+
 # How long the file size must be stable before we consider it fully written.
 _STABLE_SECS = 0.5
 _POLL_INTERVAL = 0.1
@@ -31,6 +34,9 @@ def _wait_stable(path: Path) -> bool:
         time.sleep(_POLL_INTERVAL)
 
 
+_VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".wmv", ".avi"}
+
+
 class _Handler(FileSystemEventHandler):
     def __init__(self, callback: Callable[[List[str]], None], inflight: Set[str], lock: threading.Lock):
         self._callback = callback
@@ -40,8 +46,16 @@ class _Handler(FileSystemEventHandler):
     def on_created(self, event):
         if event.is_directory:
             return
-        path = Path(event.src_path)
-        if path.suffix.lower() != ".flac":
+        self._handle_path(Path(event.src_path))
+
+    def on_moved(self, event):
+        if event.is_directory:
+            return
+        self._handle_path(Path(event.dest_path))
+
+    def _handle_path(self, path: Path) -> None:
+        suffix = path.suffix.lower()
+        if suffix not in _AUDIO_EXTS and suffix not in _VIDEO_EXTS:
             return
         key = str(path)
         with self._lock:
@@ -50,18 +64,29 @@ class _Handler(FileSystemEventHandler):
             self._inflight.add(key)
         threading.Thread(target=self._process, args=(path,), daemon=True).start()
 
-    def _process(self, flac: Path) -> None:
+    def _process(self, src: Path) -> None:
         try:
-            if not _wait_stable(flac):
+            if not _wait_stable(src):
                 return
-            paths = [str(flac)]
-            cue = flac.with_suffix(".cue")
-            if cue.exists():
-                paths.append(str(cue))
+            paths = [str(src)]
+            # For audio files, include a matching CUE if present.
+            # Strategy 1: same-stem  (album.flac / album.ape → album.cue)
+            # Strategy 2: FILE directive — scan sibling CUEs whose FILE line
+            #             references this audio file by name (handles non-matching stems)
+            if src.suffix.lower() in _AUDIO_EXTS:
+                cue = src.with_suffix(".cue")
+                if not cue.exists():
+                    for candidate in sorted(src.parent.glob("*.cue")):
+                        ref = cue_file_ref(str(candidate))
+                        if ref and Path(ref).stem.lower() == src.stem.lower():
+                            cue = candidate
+                            break
+                if cue.exists():
+                    paths.append(str(cue))
             self._callback(paths)
         finally:
             with self._lock:
-                self._inflight.discard(str(flac))
+                self._inflight.discard(str(src))
 
 
 class FolderMonitor:
