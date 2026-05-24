@@ -38,5 +38,6 @@ if __name__ == "__main__":
     # When frozen by PyInstaller, sys._MEIPASS holds the extracted bundle dir.
     _bundle_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
     _register_font(_bundle_dir / "slkscr.ttf")
-    app = App()
+    start_in_tray = "--tray" in sys.argv
+    app = App(start_in_tray=start_in_tray)
     app.mainloop()

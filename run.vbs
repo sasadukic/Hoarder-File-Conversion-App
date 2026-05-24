@@ -54,12 +54,19 @@ If pythonw = "" Then
     On Error GoTo 0
 End If
 
+' --- Collect any extra args passed via the shortcut (e.g. --tray) ---
+Dim extraArgs, i
+extraArgs = ""
+For i = 0 To WScript.Arguments.Count - 1
+    extraArgs = extraArgs & " " & WScript.Arguments.Item(i)
+Next
+
 ' --- Launch ---
 If pythonw <> "" Then
     Set f = fso.CreateTextFile(cacheFile, True)
     f.Write pythonw
     f.Close
-    wsh.Run """" & pythonw & """ """ & dir & "main.py""", 0, False
+    wsh.Run """" & pythonw & """ """ & dir & "main.py""" & extraArgs, 0, False
 Else
     MsgBox "Python installation not found.", 16, "Hoarder"
 End If

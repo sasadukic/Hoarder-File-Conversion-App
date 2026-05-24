@@ -143,8 +143,9 @@ def expand_drops(paths: List[str]) -> List[str]:
 
 
 class App(TkinterDnD.Tk):
-    def __init__(self):
+    def __init__(self, start_in_tray: bool = False):
         super().__init__()
+        self._start_in_tray = start_in_tray
         self.withdraw()  # hide until fully built — prevents blank-window flash
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
@@ -176,7 +177,10 @@ class App(TkinterDnD.Tk):
         self._preload_sounds()
         self._build_ui()
         self._check_stale_startup_shortcut()
-        self.deiconify()  # show now that UI is fully ready
+        if self._start_in_tray:
+            self._go_to_tray()
+        else:
+            self.deiconify()  # show now that UI is fully ready
 
     def _build_ui(self) -> None:
         s = self._settings
@@ -733,6 +737,15 @@ class App(TkinterDnD.Tk):
         finally:
             self._hiding_to_tray = False
 
+    def _go_to_tray(self) -> None:
+        """Hide window and start tray icon immediately (used for --tray launch)."""
+        self._tray_icon = self._build_tray_icon()
+        try:
+            self._tray_icon.run_detached()
+        except Exception as e:
+            self._tray_var.set(False)
+            self._set_status(f"Tray error: {e}", WARM)
+
     def _build_tray_icon(self) -> pystray.Icon:
         """Create a tray icon, using hoarder.ico if available."""
         _ico = Path(__file__).parent / "hoarder.ico"
@@ -801,13 +814,14 @@ class App(TkinterDnD.Tk):
         return Path(__file__).parent / "run.vbs"
 
     def _create_startup_shortcut(self) -> None:
-        """Create a .lnk in the Windows Startup folder pointing to run.bat."""
+        """Create a .lnk in the Windows Startup folder with --tray argument."""
         import subprocess
         lnk = str(self._startup_lnk_path())
         target = str(self._run_bat_path().resolve())
         ps = (
             f'$s=(New-Object -COM WScript.Shell).CreateShortcut("{lnk}");'
             f'$s.TargetPath="{target}";'
+            f'$s.Arguments="--tray";'
             f'$s.Save()'
         )
         result = subprocess.run(
