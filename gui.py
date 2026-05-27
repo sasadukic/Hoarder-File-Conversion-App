@@ -157,7 +157,7 @@ class App(TkinterDnD.Tk):
         ctk.set_window_scaling(1.0)
 
         self.title("Hoarder")
-        self.geometry("500x560")
+        self.geometry("500x620")
         self.resizable(False, False)
         self.configure(bg=BG)
 
@@ -361,6 +361,11 @@ class App(TkinterDnD.Tk):
         )
         self._magnet_handler_check.place(x=16, y=420)
 
+        # --- Torrent download progress list ---
+        self._torrent_progress_frame = tk.Frame(self, bg=DARK)
+        self._torrent_progress_frame.place(x=16, y=448, width=468, height=100)
+        self._torrent_progress_widgets: Dict[str, dict] = {}
+
         # ------------------------------------------------------------------
         # Convert button
         # ------------------------------------------------------------------
@@ -376,7 +381,7 @@ class App(TkinterDnD.Tk):
             text_color_disabled=DARK,
             corner_radius=0,
         )
-        self._convert_btn.place(x=16, y=480)
+        self._convert_btn.place(x=16, y=552)
 
         # Button wave overlay removed — button shows plain text during conversion
 
@@ -1129,19 +1134,53 @@ class App(TkinterDnD.Tk):
         if self._torrent_downloader:
             self._torrent_downloader.stop()
             self._torrent_downloader = None
+        for tid in list(self._torrent_progress_widgets):
+            self._remove_torrent_progress(tid)
 
     def _on_torrent_progress(self, tid: str, name: str, progress: float) -> None:
+        self.after(0, self._update_torrent_progress, tid, name, progress)
+
+    def _update_torrent_progress(self, tid: str, name: str, progress: float) -> None:
         if progress < 0:
-            self.after(0, self._set_status, f"Torrent error: {name}", WARM)
-        else:
-            pct = int(progress * 100)
-            self.after(0, self._set_status, f"Torrent: {name} {pct}%")
+            self._set_status(f"Torrent error: {name}", WARM)
+            self._remove_torrent_progress(tid)
+            return
+        if tid not in self._torrent_progress_widgets:
+            self._add_torrent_progress_row(tid, name)
+        widgets = self._torrent_progress_widgets[tid]
+        pct = int(progress * 100)
+        widgets["bar"].set(progress)
+        widgets["label"].config(text=f"{pct}%")
+
+    def _add_torrent_progress_row(self, tid: str, name: str) -> None:
+        frame = tk.Frame(self._torrent_progress_frame, bg=DARK)
+        frame.pack(fill="x", padx=2, pady=1)
+        short_name = name if len(name) <= 25 else name[:22] + "..."
+        lbl = tk.Label(frame, text=short_name, bg=DARK, fg=SAGE,
+                        font=("Silkscreen", 8), anchor="w", width=200)
+        lbl.pack(side="left")
+        bar = ctk.CTkProgressBar(frame, width=180, height=14)
+        bar.set(0)
+        bar.pack(side="left", padx=(4, 4))
+        pct = tk.Label(frame, text="0%", bg=DARK, fg=TEXT,
+                        font=("Silkscreen", 8), width=4)
+        pct.pack(side="left")
+        self._torrent_progress_widgets[tid] = {"frame": frame, "bar": bar, "label": pct}
+
+    def _remove_torrent_progress(self, tid: str) -> None:
+        widgets = self._torrent_progress_widgets.pop(tid, None)
+        if widgets:
+            widgets["frame"].destroy()
 
     def _on_torrent_complete(self, tid: str, download_path: str) -> None:
+        self.after(0, self._on_torrent_complete_gui, tid, download_path)
+
+    def _on_torrent_complete_gui(self, tid: str, download_path: str) -> None:
+        self._remove_torrent_progress(tid)
         monitor_folder = self._monitor_folder_var.get()
         if monitor_folder and Path(monitor_folder).is_dir():
             self._copy_downloaded_to_monitor(download_path, monitor_folder)
-        self.after(0, self._scan_and_convert_downloaded, download_path)
+        self._scan_and_convert_downloaded(download_path)
 
     def _copy_downloaded_to_monitor(self, download_path: str, monitor_folder: str) -> None:
         src = Path(download_path)
