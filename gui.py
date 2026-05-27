@@ -192,24 +192,34 @@ class App(TkinterDnD.Tk):
         # Wave animation state (drop zone only)
         self._wave_phase: float = 0.0
         self._wave_font_drop = tkfont.Font(family="Silkscreen", size=16)
+        self._wave_font_btn = tkfont.Font(family="Silkscreen", size=28)
+        self._btn_fonts = [
+            tkfont.Font(family="Silkscreen", size=s) for s in (28, 24, 20, 16, 12)
+        ]
+        self._btn_max_w = 428
 
         # ------------------------------------------------------------------
-        # Drop zone
+        # Tab view
+        # ------------------------------------------------------------------
+        self._tabview = ctk.CTkTabview(self, width=468, height=478)
+        self._tabview.place(x=16, y=8)
+
+        main_tab = self._tabview.add("Main")
+        self._tabview.add("Downloads")
+        self._tabview.add("Encoding")
+        self._tabview.add("Setup")
+
+        # ------------------------------------------------------------------
+        # Main tab — drop zone + file info + convert button
         # ------------------------------------------------------------------
         self._drop_frame = tk.Frame(
-            self,
-            bg=PANEL,
-            highlightbackground=TEAL,
-            highlightthickness=2,
-            cursor="hand2",
+            main_tab, bg=PANEL,
+            highlightbackground=TEAL, highlightthickness=2, cursor="hand2",
         )
-        self._drop_frame.place(x=16, y=12, width=468, height=76)
+        self._drop_frame.place(x=0, y=12, width=452, height=76)
 
         self._drop_canvas = tk.Canvas(
-            self._drop_frame,
-            bg=PANEL,
-            highlightthickness=0,
-            cursor="hand2",
+            self._drop_frame, bg=PANEL, highlightthickness=0, cursor="hand2",
         )
         self._drop_canvas.pack(fill="both", expand=True)
 
@@ -218,174 +228,151 @@ class App(TkinterDnD.Tk):
             widget.dnd_bind("<<Drop>>", self._on_drop)
             widget.bind("<Button-1>", lambda e: self._browse())
 
-        # ------------------------------------------------------------------
-        # File info (canvas so long filenames can marquee-scroll)
-        # ------------------------------------------------------------------
         self._scroll_text: str = ""
         self._scroll_color: str = DIM
         self._scroll_x: float = 0.0
         self._scroll_active: bool = False
 
-        self._info_canvas = tk.Canvas(self, bg=BG, highlightthickness=0)
-        self._info_canvas.place(x=16, y=98, width=468, height=36)
+        self._info_canvas = tk.Canvas(main_tab, bg=BG, highlightthickness=0)
+        self._info_canvas.place(x=0, y=98, width=452, height=36)
         self._set_info("No files loaded", DIM)
 
+        self._convert_btn = ctk.CTkButton(
+            main_tab, text="Convert", font=("Silkscreen", 28), state="disabled",
+            command=self._start_conversion, width=452, height=56,
+            fg_color=LIGHT, hover_color=LIGHT,
+            text_color=DARK, text_color_disabled=DARK, corner_radius=0,
+        )
+        self._convert_btn.place(x=0, y=148)
+        self._set_btn_text("Convert")
+
         # ------------------------------------------------------------------
-        # Checkboxes
+        # Downloads tab — torrent progress list
+        # ------------------------------------------------------------------
+        dl_tab = self._tabview.tab("Downloads")
+        self._torrent_progress_frame = tk.Frame(dl_tab, bg=BG)
+        self._torrent_progress_frame.place(x=0, y=0, width=452, height=440)
+        self._torrent_progress_widgets: Dict[str, dict] = {}
+
+        # ------------------------------------------------------------------
+        # Encoding tab — conversion progress list
+        # ------------------------------------------------------------------
+        enc_tab = self._tabview.tab("Encoding")
+        self._encoding_progress_frame = tk.Frame(enc_tab, bg=BG)
+        self._encoding_progress_frame.place(x=0, y=0, width=452, height=440)
+        self._encoding_progress_widgets: Dict[str, dict] = {}
+
+        # ------------------------------------------------------------------
+        # Setup tab — all settings
         # ------------------------------------------------------------------
         _ck = dict(
-            font=("Silkscreen", 16),
-            text_color=LIGHT,
-            fg_color=LIGHT,
-            border_color=LIGHT,
-            hover_color=LIGHT,
-            checkmark_color=DARK,
-            checkbox_width=20,
-            checkbox_height=20,
-            corner_radius=0,
+            font=("Silkscreen", 16), text_color=LIGHT, fg_color=LIGHT,
+            border_color=LIGHT, hover_color=LIGHT, checkmark_color=DARK,
+            checkbox_width=20, checkbox_height=20, corner_radius=0,
         )
+
+        setup_tab = self._tabview.tab("Setup")
 
         self._delete_var = tk.BooleanVar(value=s["delete_flac"])
         self._delete_check = ctk.CTkCheckBox(
-            self, text="Delete file after conversion",
+            setup_tab, text="Delete file after conversion",
             variable=self._delete_var, command=self._play_click, **_ck,
         )
-        self._delete_check.place(x=16, y=144)
+        self._delete_check.place(x=0, y=8)
 
         self._auto_convert_var = tk.BooleanVar(value=s["auto_convert"])
         self._auto_check = ctk.CTkCheckBox(
-            self, text="Auto-convert on load",
+            setup_tab, text="Auto-convert on load",
             variable=self._auto_convert_var, command=self._play_click, **_ck,
         )
-        self._auto_check.place(x=16, y=182)
+        self._auto_check.place(x=0, y=40)
 
         self._tray_var = tk.BooleanVar(value=s["minimize_to_tray"])
         self._tray_check = ctk.CTkCheckBox(
-            self, text="Minimize to tray",
+            setup_tab, text="Minimize to tray",
             variable=self._tray_var, command=self._on_tray_toggle, **_ck,
         )
-        self._tray_check.place(x=16, y=220)
+        self._tray_check.place(x=0, y=72)
 
         self._startup_var = tk.BooleanVar(value=s["start_on_startup"])
         self._startup_check = ctk.CTkCheckBox(
-            self, text="Start on Windows startup",
+            setup_tab, text="Start on Windows startup",
             variable=self._startup_var, command=self._on_startup_toggle, **_ck,
         )
-        self._startup_check.place(x=16, y=258)
+        self._startup_check.place(x=0, y=104)
 
-        # ------------------------------------------------------------------
-        # Folder monitor row
-        # ------------------------------------------------------------------
+        # --- Monitor folder row ---
         self._monitor_var = tk.BooleanVar(value=False)
         self._monitor_check = ctk.CTkCheckBox(
-            self, text="Monitor folder",
+            setup_tab, text="Monitor folder",
             variable=self._monitor_var, command=self._on_monitor_toggle, **_ck,
         )
-        self._monitor_check.place(x=16, y=296)
+        self._monitor_check.place(x=0, y=136)
 
         self._monitor_browse_btn = ctk.CTkButton(
-            self, text="Browse…", font=("Silkscreen", 16),
-            width=94, height=28,
-            fg_color=DARK, hover_color=DARK,
-            text_color=LIGHT,
-            border_color=LIGHT, border_width=2,
-            corner_radius=0,
-            command=self._browse_monitor_folder,
+            setup_tab, text="Browse…", font=("Silkscreen", 16),
+            width=94, height=28, fg_color=DARK, hover_color=DARK,
+            text_color=LIGHT, border_color=LIGHT, border_width=2,
+            corner_radius=0, command=self._browse_monitor_folder,
         )
-        self._monitor_browse_btn.place(x=390, y=296)
+        self._monitor_browse_btn.place(x=350, y=136)
 
         saved_folder = s["monitor_folder"] or ""
         if saved_folder and not Path(saved_folder).is_dir():
             saved_folder = ""
         self._monitor_folder_var = tk.StringVar(value=saved_folder)
         self._monitor_folder_label = tk.Label(
-            self,
-            text="",
-            bg=BG, fg=DIM,
-            font=("Silkscreen", 8),
-            anchor="w", wraplength=0,
+            setup_tab, text="", bg=BG, fg=DIM,
+            font=("Silkscreen", 8), anchor="w", wraplength=0,
         )
-        self._monitor_folder_label.place(x=16, y=334, width=468, height=30)
-        self._monitor_folder_var.trace_add(
-            "write",
-            lambda *_: self._update_folder_display(),
-        )
+        self._monitor_folder_label.place(x=0, y=168, width=452, height=30)
+        self._monitor_folder_var.trace_add("write", lambda *_: self._update_folder_display())
         self._update_folder_display()
 
-        # --- Torrent row ---
+        # --- Torrent settings ---
         self._torrent_var = tk.BooleanVar(value=s.get("torrent_enabled", False))
         self._torrent_check = ctk.CTkCheckBox(
-            self, text="Auto-download torrents",
+            setup_tab, text="Auto-download torrents",
             variable=self._torrent_var, command=self._on_torrent_toggle, **_ck,
         )
-        self._torrent_check.place(x=16, y=360)
+        self._torrent_check.place(x=0, y=204)
 
         self._torrent_download_browse_btn = ctk.CTkButton(
-            self, text="Download…", font=("Silkscreen", 16),
-            width=94, height=28,
-            fg_color=DARK, hover_color=DARK,
-            text_color=LIGHT,
-            border_color=LIGHT, border_width=2,
-            corner_radius=0,
-            command=self._browse_torrent_download_folder,
+            setup_tab, text="Download…", font=("Silkscreen", 16),
+            width=94, height=28, fg_color=DARK, hover_color=DARK,
+            text_color=LIGHT, border_color=LIGHT, border_width=2,
+            corner_radius=0, command=self._browse_torrent_download_folder,
         )
-        self._torrent_download_browse_btn.place(x=200, y=360)
+        self._torrent_download_browse_btn.place(x=200, y=204)
 
         self._torrent_finished_browse_btn = ctk.CTkButton(
-            self, text="Finished…", font=("Silkscreen", 16),
-            width=94, height=28,
-            fg_color=DARK, hover_color=DARK,
-            text_color=LIGHT,
-            border_color=LIGHT, border_width=2,
-            corner_radius=0,
-            command=self._browse_torrent_finished_folder,
+            setup_tab, text="Finished…", font=("Silkscreen", 16),
+            width=94, height=28, fg_color=DARK, hover_color=DARK,
+            text_color=LIGHT, border_color=LIGHT, border_width=2,
+            corner_radius=0, command=self._browse_torrent_finished_folder,
         )
-        self._torrent_finished_browse_btn.place(x=300, y=360)
+        self._torrent_finished_browse_btn.place(x=300, y=204)
 
         saved_dl = s.get("torrent_download_folder") or ""
         saved_fin = s.get("torrent_finished_folder") or ""
         self._torrent_download_var = tk.StringVar(value=saved_dl)
         self._torrent_finished_var = tk.StringVar(value=saved_fin)
-        
+
         self._torrent_delete_var = tk.BooleanVar(value=s.get("torrent_delete_source", False))
         self._torrent_delete_check = ctk.CTkCheckBox(
-            self, text="Delete torrent file after adding",
+            setup_tab, text="Delete torrent file after adding",
             variable=self._torrent_delete_var, **_ck,
         )
-        self._torrent_delete_check.place(x=16, y=392)
-        
+        self._torrent_delete_check.place(x=0, y=236)
+
         self._magnet_handler_var = tk.BooleanVar(value=self._is_magnet_handler_registered())
         self._magnet_handler_check = ctk.CTkCheckBox(
-            self, text="Open magnet links in Hoarder",
+            setup_tab, text="Open magnet links in Hoarder",
             variable=self._magnet_handler_var, command=self._on_magnet_handler_toggle, **_ck,
         )
-        self._magnet_handler_check.place(x=16, y=420)
+        self._magnet_handler_check.place(x=0, y=268)
 
-        # --- Torrent download progress list ---
-        self._torrent_progress_frame = tk.Frame(self, bg=DARK)
-        self._torrent_progress_frame.place(x=16, y=448, width=468, height=100)
-        self._torrent_progress_widgets: Dict[str, dict] = {}
-
-        # ------------------------------------------------------------------
-        # Convert button
-        # ------------------------------------------------------------------
-        self._convert_btn = ctk.CTkButton(
-            self,
-            text="Convert",
-            font=("Silkscreen", 28),
-            state="disabled",
-            command=self._start_conversion,
-            width=468, height=56,
-            fg_color=LIGHT, hover_color=LIGHT,
-            text_color=DARK,
-            text_color_disabled=DARK,
-            corner_radius=0,
-        )
-        self._convert_btn.place(x=16, y=552)
-
-        # Button wave overlay removed — button shows plain text during conversion
-
-        # Settings traces
+        # --- Settings traces ---
         for var in (
             self._delete_var, self._auto_convert_var,
             self._tray_var, self._startup_var,
@@ -398,13 +385,42 @@ class App(TkinterDnD.Tk):
 
         self.bind("<Unmap>", self._on_unmap)
 
-        # Restore monitor state (must be after _status_label is created)
+        # Restore monitor state
         if s["monitor_folder"] and s["monitor_enabled"]:
             self._monitor_var.set(True)
             self._start_monitor(s["monitor_folder"])
 
         # Start animation loop
         self.after(40, self._wave_tick)
+
+    # ------------------------------------------------------------------
+    # Text truncation helpers — prevent UI overflow on status/info
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _elide(text: str, font, max_px: int) -> str:
+        if not text or font.measure(text) <= max_px:
+            return text
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.measure(text[:mid] + "\u2026") <= max_px:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo] + "\u2026"
+
+    def _set_btn_text(self, text: str) -> None:
+        """Set convert button text, shrinking font until it fits."""
+        for font in self._btn_fonts:
+            if font.measure(text) <= self._btn_max_w:
+                size = font.cget("size")
+                self._convert_btn.configure(text=text, font=("Silkscreen", size))
+                return
+        small = self._btn_fonts[-1]
+        truncated = self._elide(text, small, self._btn_max_w)
+        self._convert_btn.configure(
+            text=truncated, font=("Silkscreen", small.cget("size"))
+        )
 
     # ------------------------------------------------------------------
     # Sound
@@ -606,11 +622,18 @@ class App(TkinterDnD.Tk):
         grand_total = max(audio_units + video_units, 1)
         completed = [0]
 
+        # Register encoding tasks in the Encoding tab
+        self.after(0, self._clear_encoding_progress)
+        for f in flacs:
+            self.after(0, self._add_encoding_progress, f, Path(f).name)
+        for v in videos:
+            self.after(0, self._add_encoding_progress, v, Path(v).name)
+
         def on_audio_progress(cur: int, total: int) -> None:
             completed[0] = cur
-            # Show current file name (cur is 1-indexed; use the FLAC paths list)
             if flacs and 0 <= cur - 1 < len(flacs):
                 self.after(0, self._set_converting_file, flacs[cur - 1])
+                self.after(0, self._update_encoding_progress, flacs[cur - 1], 1.0)
             pct = int(completed[0] / grand_total * 100)
             self.after(0, self._set_status, f"Conversion Running {pct}%")
 
@@ -621,6 +644,9 @@ class App(TkinterDnD.Tk):
             if idx != _last_video_idx[0] and 0 <= idx < len(videos):
                 _last_video_idx[0] = idx
                 self.after(0, self._set_converting_file, videos[idx])
+            if 0 <= idx < len(videos):
+                frac = cur - int(cur) if cur > 0 else 0.0
+                self.after(0, self._update_encoding_progress, videos[idx], min(frac, 1.0))
             pct = int((audio_units + cur) / grand_total * 100)
             self.after(0, self._set_status, f"Conversion Running {pct}%")
 
@@ -663,6 +689,7 @@ class App(TkinterDnD.Tk):
             # Done
             self.after(0, self._play_done)
             self.after(0, self._show_done)
+            self.after(3000, self._clear_encoding_progress)
             if do_delete:
                 self.after(3000, self._reset_ui)
 
@@ -1188,6 +1215,43 @@ class App(TkinterDnD.Tk):
         if monitor_folder and Path(monitor_folder).is_dir():
             self._copy_downloaded_to_monitor(download_path, monitor_folder)
         self._scan_and_convert_downloaded(download_path)
+
+    # ------------------------------------------------------------------
+    # Encoding progress (Encoding tab)
+    # ------------------------------------------------------------------
+    def _add_encoding_progress(self, task_id: str, name: str) -> None:
+        frame = tk.Frame(self._encoding_progress_frame, bg=BG)
+        frame.pack(fill="x", padx=2, pady=1)
+        short_name = name if len(name) <= 25 else name[:22] + "..."
+        name_lbl = tk.Label(frame, text=short_name, bg=BG, fg=SAGE,
+                            font=("Silkscreen", 8), anchor="w", width=200)
+        name_lbl.pack(side="left")
+        bar = ctk.CTkProgressBar(frame, width=180, height=14)
+        bar.set(0)
+        bar.pack(side="left", padx=(4, 4))
+        pct = tk.Label(frame, text="0%", bg=BG, fg=TEXT,
+                        font=("Silkscreen", 8), width=4)
+        pct.pack(side="left")
+        self._encoding_progress_widgets[task_id] = {
+            "frame": frame, "bar": bar, "label": pct, "name_lbl": name_lbl,
+        }
+
+    def _update_encoding_progress(self, task_id: str, progress: float) -> None:
+        widgets = self._encoding_progress_widgets.get(task_id)
+        if not widgets:
+            return
+        pct = int(progress * 100)
+        widgets["bar"].set(progress)
+        widgets["label"].config(text=f"{pct}%")
+
+    def _remove_encoding_progress(self, task_id: str) -> None:
+        widgets = self._encoding_progress_widgets.pop(task_id, None)
+        if widgets:
+            widgets["frame"].destroy()
+
+    def _clear_encoding_progress(self) -> None:
+        for task_id in list(self._encoding_progress_widgets):
+            self._remove_encoding_progress(task_id)
 
     def _copy_downloaded_to_monitor(self, download_path: str, monitor_folder: str) -> None:
         src = Path(download_path)
