@@ -577,3 +577,34 @@ def test_delete_companion_files_preserves_m3u_txt_while_sibling_audio_exists(tmp
     assert disc2_flac.exists()
     assert disc2_m3u.exists()   # preserved — disc 2 FLAC still on disk
     assert disc2_txt.exists()   # preserved
+
+
+# --- copy_to_finished ---
+
+def test_copy_to_finished_creates_folder_and_copies(tmp_path):
+    from converter import copy_to_finished
+    src = tmp_path / "output.mp3"
+    src.write_text("music")
+    finished = tmp_path / "done"
+    result = copy_to_finished([str(src)], str(finished))
+    assert result is None
+    assert (finished / "output.mp3").exists()
+    assert (finished / "output.mp3").read_text() == "music"
+
+def test_copy_to_finished_missing_file_skips_silently(tmp_path):
+    from converter import copy_to_finished
+    finished = tmp_path / "done"
+    result = copy_to_finished([str(tmp_path / "missing.mp3")], str(finished))
+    assert result is None
+
+def test_copy_to_finished_multiple_files(tmp_path):
+    from converter import copy_to_finished
+    f1 = tmp_path / "a.mp3"
+    f2 = tmp_path / "b.mp3"
+    f1.write_text("a")
+    f2.write_text("b")
+    finished = tmp_path / "done"
+    result = copy_to_finished([str(f1), str(f2)], str(finished))
+    assert result is None
+    assert (finished / "a.mp3").exists()
+    assert (finished / "b.mp3").exists()
