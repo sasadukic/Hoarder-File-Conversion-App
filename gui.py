@@ -204,18 +204,18 @@ class App(TkinterDnD.Tk):
         self._tabview = ctk.CTkTabview(
             self, width=468, height=478,
             fg_color=BG,
+            corner_radius=0,
+            border_width=2,
             segmented_button_fg_color=DARK,
             segmented_button_selected_color=LIGHT,
             segmented_button_unselected_color=DARK,
             segmented_button_selected_hover_color=LIGHT,
             segmented_button_unselected_hover_color=DARK,
             text_color=LIGHT,
-            corner_radius=0,
         )
         self._tabview.place(x=16, y=8)
         self._tabview._segmented_button.configure(
             font=("Silkscreen", 16),
-            corner_radius=0,
             text_color=DARK,
         )
 
