@@ -11,6 +11,10 @@ DEFAULTS = {
     "start_on_startup": False,
     "monitor_enabled": False,
     "monitor_folder": None,
+    "torrent_enabled": False,
+    "torrent_download_folder": None,
+    "torrent_finished_folder": None,
+    "torrent_delete_source": False,
 }
 
 

@@ -328,6 +328,28 @@ def delete_flacs(flac_paths: List[str]) -> Optional[str]:
     return None
 
 
+def copy_to_finished(converted_paths: List[str], finished_folder: str) -> Optional[str]:
+    """Copy converted files to the finished folder.
+
+    Returns a warning string if any copy fails, otherwise None.
+    Missing files are silently skipped.
+    """
+    finished = Path(finished_folder)
+    finished.mkdir(parents=True, exist_ok=True)
+    failures = []
+    for path in converted_paths:
+        src = Path(path)
+        if not src.exists():
+            continue
+        try:
+            shutil.copy2(str(src), str(finished / src.name))
+        except OSError as e:
+            failures.append(f"{src.name}: {e}")
+    if failures:
+        return "Warning: could not copy to finished folder: " + "; ".join(failures)
+    return None
+
+
 def delete_companion_files(
     flac_paths: List[str],
     cue_path: Optional[str] = None,
