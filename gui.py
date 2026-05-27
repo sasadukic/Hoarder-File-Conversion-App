@@ -157,7 +157,7 @@ class App(TkinterDnD.Tk):
         ctk.set_window_scaling(1.0)
 
         self.title("Hoarder")
-        self.geometry("500x520")
+        self.geometry("500x560")
         self.resizable(False, False)
         self.configure(bg=BG)
 
@@ -376,7 +376,7 @@ class App(TkinterDnD.Tk):
             text_color_disabled=DARK,
             corner_radius=0,
         )
-        self._convert_btn.place(x=16, y=448)
+        self._convert_btn.place(x=16, y=480)
 
         # Button wave overlay removed — button shows plain text during conversion
 
