@@ -1003,48 +1003,87 @@ class App(TkinterDnD.Tk):
 
     def _register_magnet_handler(self) -> None:
         """Register Hoarder as the magnet: URI handler for the current user."""
+        cmd = self._magnet_handler_exe_cmd()
+        # 1. Protocol class entry
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\magnet") as key:
             winreg.SetValueEx(key, "", 0, winreg.REG_SZ, "URL:Magnet protocol")
             winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
         with winreg.CreateKey(
             winreg.HKEY_CURRENT_USER, r"Software\Classes\magnet\shell\open\command"
         ) as key:
-            winreg.SetValueEx(key, "", 0, winreg.REG_SZ, self._magnet_handler_exe_cmd())
+            winreg.SetValueEx(key, "", 0, winreg.REG_SZ, cmd)
+        # 2. Capabilities entry (what Chrome/Edge look for)
+        with winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER, r"Software\Classes\Hoarder\Capabilities"
+        ) as key:
+            winreg.SetValueEx(key, "ApplicationName", 0, winreg.REG_SZ, "Hoarder")
+            winreg.SetValueEx(
+                key, "ApplicationDescription", 0, winreg.REG_SZ,
+                "Torrent and media converter",
+            )
+        with winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Classes\Hoarder\Capabilities\URLAssociations",
+        ) as key:
+            winreg.SetValueEx(key, "magnet", 0, winreg.REG_SZ, "magnet")
+        # 3. Registered applications entry
+        with winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER, r"Software\RegisteredApplications"
+        ) as key:
+            winreg.SetValueEx(
+                key, "Hoarder", 0, winreg.REG_SZ,
+                r"Software\Classes\Hoarder\Capabilities",
+            )
 
     def _unregister_magnet_handler(self) -> None:
         """Remove Hoarder as the magnet: URI handler."""
+        # Remove RegisteredApplications entry
         try:
-            winreg.DeleteKey(
-                winreg.HKEY_CURRENT_USER, r"Software\Classes\magnet\shell\open\command"
-            )
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, r"Software\RegisteredApplications",
+                0, winreg.KEY_ALL_ACCESS,
+            ) as key:
+                winreg.DeleteValue(key, "Hoarder")
         except FileNotFoundError:
             pass
-        try:
-            winreg.DeleteKey(
-                winreg.HKEY_CURRENT_USER, r"Software\Classes\magnet\shell\open"
-            )
-        except FileNotFoundError:
+        except OSError:
             pass
-        try:
-            winreg.DeleteKey(
-                winreg.HKEY_CURRENT_USER, r"Software\Classes\magnet\shell"
-            )
-        except FileNotFoundError:
-            pass
-        try:
-            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\magnet")
-        except FileNotFoundError:
-            pass
+        # Remove Capabilities/URLAssociations
+        for subkey in [
+            r"Software\Classes\Hoarder\Capabilities\URLAssociations",
+            r"Software\Classes\Hoarder\Capabilities",
+            r"Software\Classes\Hoarder",
+        ]:
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, subkey)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        # Remove protocol class
+        for subkey in [
+            r"Software\Classes\magnet\shell\open\command",
+            r"Software\Classes\magnet\shell\open",
+            r"Software\Classes\magnet\shell",
+            r"Software\Classes\magnet",
+        ]:
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, subkey)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
 
     @staticmethod
     def _is_magnet_handler_registered() -> bool:
         """Check if Hoarder is currently registered as the magnet handler."""
         try:
             with winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER, r"Software\Classes\magnet\shell\open\command"
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Classes\Hoarder\Capabilities\URLAssociations",
             ) as key:
-                value, _ = winreg.QueryValueEx(key, "")
-                return "Hoarder" in value or "main.py" in value
+                val, _ = winreg.QueryValueEx(key, "magnet")
+                return val == "magnet"
         except FileNotFoundError:
             return False
 
