@@ -201,8 +201,26 @@ class App(TkinterDnD.Tk):
         # ------------------------------------------------------------------
         # Tab view
         # ------------------------------------------------------------------
-        self._tabview = ctk.CTkTabview(self, width=468, height=478)
+        self._tabview = ctk.CTkTabview(
+            self, width=468, height=478,
+            fg_color=BG,
+            segmented_button_fg_color=DARK,
+            segmented_button_selected_color=LIGHT,
+            segmented_button_unselected_color=DARK,
+            segmented_button_selected_hover_color=LIGHT,
+            segmented_button_unselected_hover_color=DARK,
+            segmented_button_selected_text_color=DARK,
+            segmented_button_unselected_text_color=LIGHT,
+            text_color=LIGHT,
+            corner_radius=0,
+        )
         self._tabview.place(x=16, y=8)
+        self._tabview._segmented_button.configure(
+            font=("Silkscreen", 16),
+            border_width=2,
+            border_color=LIGHT,
+            corner_radius=0,
+        )
 
         main_tab = self._tabview.add("Main")
         self._tabview.add("Downloads")
