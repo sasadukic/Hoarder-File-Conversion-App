@@ -163,6 +163,7 @@ class TorrentDownloader:
         if aria2c is None:
             self._names.pop(tid, None)
             self._progress.pop(tid, None)
+            self.on_progress(tid, name, -1.0)
             return None
         cmd = [aria2c, "--seed-time=0", "-d", self.download_dir, target]
         proc = subprocess.Popen(
@@ -173,21 +174,27 @@ class TorrentDownloader:
         )
         with self._lock:
             self._aria2c_procs[tid] = proc
+        self.on_progress(tid, name, 0.0)
         self._spawn_aria2c_monitor(tid, proc, name)
         return tid
 
     def _spawn_aria2c_monitor(self, tid: str, proc: subprocess.Popen, name: str) -> None:
         def _monitor():
+            rc = -1
             try:
-                proc.wait()
+                rc = proc.wait()
             except Exception:
                 pass
             with self._lock:
                 self._aria2c_procs.pop(tid, None)
+            if rc == 0:
                 self._progress[tid] = 1.0
-            self.on_progress(tid, name, 1.0)
-            download_path = os.path.join(self.download_dir, name)
-            self.on_complete(tid, download_path)
+                self.on_progress(tid, name, 1.0)
+                download_path = os.path.join(self.download_dir, name)
+                self.on_complete(tid, download_path)
+            else:
+                self._progress[tid] = -1.0
+                self.on_progress(tid, name, -1.0)
 
         t = threading.Thread(target=_monitor, daemon=True)
         t.start()

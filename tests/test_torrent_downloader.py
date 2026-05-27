@@ -126,6 +126,7 @@ def test_aria2c_callbacks_on_exit(tmp_path):
 
     mock_proc = MagicMock()
     mock_proc.returncode = 0
+    mock_proc.wait.return_value = 0
 
     with patch("torrent_downloader._find_aria2c", return_value="/fake/aria2c"):
         with patch("torrent_downloader.subprocess.Popen", return_value=mock_proc):
@@ -145,7 +146,8 @@ def test_aria2c_callbacks_on_exit(tmp_path):
             assert complete_calls[0][0] == tid
             assert "MyFile" in complete_calls[0][1]
 
-            # on_progress should be called with 1.0 on completion
+            # on_progress should be called with 0.0 (start) and 1.0 (complete)
+            assert any(p[2] == 0.0 for p in progress_calls)
             assert any(p[2] == 1.0 for p in progress_calls)
 
             td.stop()

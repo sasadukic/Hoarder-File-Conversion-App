@@ -1142,8 +1142,13 @@ class App(TkinterDnD.Tk):
 
     def _update_torrent_progress(self, tid: str, name: str, progress: float) -> None:
         if progress < 0:
-            self._set_status(f"Torrent error: {name}", WARM)
-            self._remove_torrent_progress(tid)
+            if tid not in self._torrent_progress_widgets:
+                self._add_torrent_progress_row(tid, name)
+            widgets = self._torrent_progress_widgets[tid]
+            widgets["bar"].set(0)
+            widgets["label"].config(text="Error", fg=WARM)
+            widgets["name_lbl"].config(fg=WARM)
+            self.after(5000, self._remove_torrent_progress, tid)
             return
         if tid not in self._torrent_progress_widgets:
             self._add_torrent_progress_row(tid, name)
@@ -1156,16 +1161,18 @@ class App(TkinterDnD.Tk):
         frame = tk.Frame(self._torrent_progress_frame, bg=DARK)
         frame.pack(fill="x", padx=2, pady=1)
         short_name = name if len(name) <= 25 else name[:22] + "..."
-        lbl = tk.Label(frame, text=short_name, bg=DARK, fg=SAGE,
-                        font=("Silkscreen", 8), anchor="w", width=200)
-        lbl.pack(side="left")
+        name_lbl = tk.Label(frame, text=short_name, bg=DARK, fg=SAGE,
+                            font=("Silkscreen", 8), anchor="w", width=200)
+        name_lbl.pack(side="left")
         bar = ctk.CTkProgressBar(frame, width=180, height=14)
         bar.set(0)
         bar.pack(side="left", padx=(4, 4))
         pct = tk.Label(frame, text="0%", bg=DARK, fg=TEXT,
                         font=("Silkscreen", 8), width=4)
         pct.pack(side="left")
-        self._torrent_progress_widgets[tid] = {"frame": frame, "bar": bar, "label": pct}
+        self._torrent_progress_widgets[tid] = {
+            "frame": frame, "bar": bar, "label": pct, "name_lbl": name_lbl,
+        }
 
     def _remove_torrent_progress(self, tid: str) -> None:
         widgets = self._torrent_progress_widgets.pop(tid, None)
