@@ -209,8 +209,6 @@ class App(TkinterDnD.Tk):
             segmented_button_unselected_color=DARK,
             segmented_button_selected_hover_color=LIGHT,
             segmented_button_unselected_hover_color=DARK,
-            segmented_button_selected_text_color=DARK,
-            segmented_button_unselected_text_color=LIGHT,
             text_color=LIGHT,
             corner_radius=0,
         )
@@ -220,6 +218,7 @@ class App(TkinterDnD.Tk):
             border_width=2,
             border_color=LIGHT,
             corner_radius=0,
+            text_color=DARK,
         )
 
         main_tab = self._tabview.add("Main")
