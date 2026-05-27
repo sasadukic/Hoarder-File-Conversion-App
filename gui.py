@@ -215,8 +215,6 @@ class App(TkinterDnD.Tk):
         self._tabview.place(x=16, y=8)
         self._tabview._segmented_button.configure(
             font=("Silkscreen", 16),
-            border_width=2,
-            border_color=LIGHT,
             corner_radius=0,
             text_color=DARK,
         )
