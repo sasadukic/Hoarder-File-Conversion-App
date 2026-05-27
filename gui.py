@@ -3,6 +3,7 @@ import io
 import math
 import sys
 import tempfile
+import winreg
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
@@ -353,14 +354,12 @@ class App(TkinterDnD.Tk):
         )
         self._torrent_delete_check.place(x=16, y=392)
         
-        self._torrent_status_label = tk.Label(
-            self,
-            text="",
-            bg=BG, fg=DIM,
-            font=("Silkscreen", 8),
-            anchor="w", wraplength=0,
+        self._magnet_handler_var = tk.BooleanVar(value=self._is_magnet_handler_registered())
+        self._magnet_handler_check = ctk.CTkCheckBox(
+            self, text="Open magnet links in Hoarder",
+            variable=self._magnet_handler_var, command=self._on_magnet_handler_toggle, **_ck,
         )
-        self._torrent_status_label.place(x=16, y=420, width=468, height=20)
+        self._magnet_handler_check.place(x=16, y=420)
 
         # ------------------------------------------------------------------
         # Convert button
@@ -388,6 +387,7 @@ class App(TkinterDnD.Tk):
             self._monitor_var, self._monitor_folder_var,
             self._torrent_var, self._torrent_download_var,
             self._torrent_finished_var, self._torrent_delete_var,
+            self._magnet_handler_var,
         ):
             var.trace_add("write", lambda *_: self._save_settings())
 
@@ -975,6 +975,87 @@ class App(TkinterDnD.Tk):
             self._start_torrent_downloader()
         else:
             self._stop_torrent_downloader()
+
+    # ------------------------------------------------------------------
+    # Magnet protocol handler (Windows registry)
+    # ------------------------------------------------------------------
+    def _on_magnet_handler_toggle(self) -> None:
+        self._play_click()
+        try:
+            if self._magnet_handler_var.get():
+                self._register_magnet_handler()
+            else:
+                self._unregister_magnet_handler()
+        except OSError as e:
+            self._set_status(f"Magnet handler error: {e}", WARM)
+            self._magnet_handler_var.set(not self._magnet_handler_var.get())
+
+    @staticmethod
+    def _magnet_handler_exe_cmd() -> str:
+        """Return the command string for the magnet protocol handler."""
+        if getattr(sys, "frozen", False):
+            exe = Path(sys.executable)
+            return f'"{exe}" --magnet "%1"'
+        # Development mode: python.exe main.py --magnet "%1"
+        exe = Path(sys.executable)
+        script = Path(__file__).parent / "main.py"
+        return f'"{exe}" "{script}" --magnet "%1"'
+
+    def _register_magnet_handler(self) -> None:
+        """Register Hoarder as the magnet: URI handler for the current user."""
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\magnet") as key:
+            winreg.SetValueEx(key, "", 0, winreg.REG_SZ, "URL:Magnet protocol")
+            winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
+        with winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER, r"Software\Classes\magnet\shell\open\command"
+        ) as key:
+            winreg.SetValueEx(key, "", 0, winreg.REG_SZ, self._magnet_handler_exe_cmd())
+
+    def _unregister_magnet_handler(self) -> None:
+        """Remove Hoarder as the magnet: URI handler."""
+        try:
+            winreg.DeleteKey(
+                winreg.HKEY_CURRENT_USER, r"Software\Classes\magnet\shell\open\command"
+            )
+        except FileNotFoundError:
+            pass
+        try:
+            winreg.DeleteKey(
+                winreg.HKEY_CURRENT_USER, r"Software\Classes\magnet\shell\open"
+            )
+        except FileNotFoundError:
+            pass
+        try:
+            winreg.DeleteKey(
+                winreg.HKEY_CURRENT_USER, r"Software\Classes\magnet\shell"
+            )
+        except FileNotFoundError:
+            pass
+        try:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\magnet")
+        except FileNotFoundError:
+            pass
+
+    @staticmethod
+    def _is_magnet_handler_registered() -> bool:
+        """Check if Hoarder is currently registered as the magnet handler."""
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, r"Software\Classes\magnet\shell\open\command"
+            ) as key:
+                value, _ = winreg.QueryValueEx(key, "")
+                return "Hoarder" in value or "main.py" in value
+        except FileNotFoundError:
+            return False
+
+    def _handle_magnet_link(self, magnet_uri: str) -> None:
+        """Handle a magnet URI passed via command line or browser."""
+        if not self._torrent_var.get():
+            self._torrent_var.set(True)
+            self._start_torrent_downloader()
+        if self._torrent_downloader:
+            self._torrent_downloader.add(magnet_uri)
+            self._set_status(f"Added magnet link")
 
     def _browse_torrent_download_folder(self) -> None:
         self._play_click()

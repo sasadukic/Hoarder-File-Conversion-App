@@ -39,5 +39,18 @@ if __name__ == "__main__":
     _bundle_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
     _register_font(_bundle_dir / "slkscr.ttf")
     start_in_tray = "--tray" in sys.argv
+
+    # Parse magnet URI passed from browser protocol handler
+    magnet_uri: str | None = None
+    for i, arg in enumerate(sys.argv):
+        if arg == "--magnet" and i + 1 < len(sys.argv):
+            magnet_uri = sys.argv[i + 1]
+            break
+        elif arg.startswith("magnet:?"):
+            magnet_uri = arg
+            break
+
     app = App(start_in_tray=start_in_tray)
+    if magnet_uri:
+        app.after(100, lambda uri=magnet_uri: app._handle_magnet_link(uri))
     app.mainloop()
