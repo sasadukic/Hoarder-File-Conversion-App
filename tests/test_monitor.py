@@ -17,7 +17,7 @@ def wait_for(condition_fn, timeout=5.0, interval=0.05):
 
 def test_detects_new_flac(tmp_path):
     received = []
-    m = FolderMonitor(str(tmp_path), lambda paths: received.append(paths))
+    m = FolderMonitor(str(tmp_path), lambda paths: received.append(paths), lambda paths: None)
     m.start()
     try:
         flac = tmp_path / "track.flac"
@@ -30,7 +30,7 @@ def test_detects_new_flac(tmp_path):
 
 def test_pairs_cue_with_flac(tmp_path):
     received = []
-    m = FolderMonitor(str(tmp_path), lambda paths: received.append(paths))
+    m = FolderMonitor(str(tmp_path), lambda paths: received.append(paths), lambda paths: None)
     m.start()
     try:
         cue = tmp_path / "album.cue"
@@ -48,7 +48,7 @@ def test_pairs_cue_with_flac(tmp_path):
 
 def test_ignores_non_flac_files(tmp_path):
     received = []
-    m = FolderMonitor(str(tmp_path), lambda paths: received.append(paths))
+    m = FolderMonitor(str(tmp_path), lambda paths: received.append(paths), lambda paths: None)
     m.start()
     try:
         (tmp_path / "notes.txt").write_text("hello")
@@ -60,7 +60,7 @@ def test_ignores_non_flac_files(tmp_path):
 
 def test_no_duplicate_trigger(tmp_path):
     received = []
-    m = FolderMonitor(str(tmp_path), lambda paths: received.append(paths))
+    m = FolderMonitor(str(tmp_path), lambda paths: received.append(paths), lambda paths: None)
     m.start()
     try:
         flac = tmp_path / "track.flac"
@@ -76,7 +76,7 @@ def test_detects_flac_in_subfolder(tmp_path):
     received = []
     sub = tmp_path / "sub"
     sub.mkdir()
-    m = FolderMonitor(str(tmp_path), lambda paths: received.append(paths))
+    m = FolderMonitor(str(tmp_path), lambda paths: received.append(paths), lambda paths: None)
     m.start()
     try:
         flac = sub / "deep.flac"
@@ -88,7 +88,51 @@ def test_detects_flac_in_subfolder(tmp_path):
 
 
 def test_stop_is_idempotent(tmp_path):
-    m = FolderMonitor(str(tmp_path), lambda paths: None)
+    m = FolderMonitor(str(tmp_path), lambda paths: None, lambda paths: None)
     m.start()
     m.stop()
     m.stop()  # should not raise
+
+
+def test_detects_torrent_file(tmp_path):
+    received = []
+    m = FolderMonitor(str(tmp_path), lambda paths: None, lambda paths: received.append(paths))
+    m.start()
+    try:
+        torrent = tmp_path / "movie.torrent"
+        torrent.write_bytes(b"d8:announce" + b"\x00" * 50)
+        assert wait_for(lambda: len(received) == 1), "torrent callback not fired"
+        assert received[0] == [str(torrent)]
+    finally:
+        m.stop()
+
+
+def test_detects_magnet_file(tmp_path):
+    received = []
+    m = FolderMonitor(str(tmp_path), lambda paths: None, lambda paths: received.append(paths))
+    m.start()
+    try:
+        magnet = tmp_path / "link.magnet"
+        magnet.write_text("magnet:?xt=urn:btih:abc123")
+        assert wait_for(lambda: len(received) == 1), "magnet callback not fired"
+        assert received[0] == [str(magnet)]
+    finally:
+        m.stop()
+
+
+def test_ignores_non_media_non_torrent_files(tmp_path):
+    received_files = []
+    received_torrents = []
+    m = FolderMonitor(
+        str(tmp_path),
+        lambda paths: received_files.append(paths),
+        lambda paths: received_torrents.append(paths),
+    )
+    m.start()
+    try:
+        (tmp_path / "notes.txt").write_text("hello")
+        time.sleep(0.8)
+        assert len(received_files) == 0
+        assert len(received_torrents) == 0
+    finally:
+        m.stop()

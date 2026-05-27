@@ -35,11 +35,15 @@ def _wait_stable(path: Path) -> bool:
 
 
 _VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".wmv", ".avi"}
+_TORRENT_EXTS = {".torrent", ".magnet"}
 
 
 class _Handler(FileSystemEventHandler):
-    def __init__(self, callback: Callable[[List[str]], None], inflight: Set[str], lock: threading.Lock):
+    def __init__(self, callback: Callable[[List[str]], None],
+                 torrent_callback: Callable[[List[str]], None],
+                 inflight: Set[str], lock: threading.Lock):
         self._callback = callback
+        self._torrent_callback = torrent_callback
         self._inflight = inflight
         self._lock = lock
 
@@ -55,6 +59,14 @@ class _Handler(FileSystemEventHandler):
 
     def _handle_path(self, path: Path) -> None:
         suffix = path.suffix.lower()
+        if suffix in _TORRENT_EXTS:
+            key = str(path)
+            with self._lock:
+                if key in self._inflight:
+                    return
+                self._inflight.add(key)
+            threading.Thread(target=self._process_torrent, args=(path,), daemon=True).start()
+            return
         if suffix not in _AUDIO_EXTS and suffix not in _VIDEO_EXTS:
             return
         key = str(path)
@@ -63,6 +75,15 @@ class _Handler(FileSystemEventHandler):
                 return
             self._inflight.add(key)
         threading.Thread(target=self._process, args=(path,), daemon=True).start()
+
+    def _process_torrent(self, src: Path) -> None:
+        try:
+            if not _wait_stable(src):
+                return
+            self._torrent_callback([str(src)])
+        finally:
+            with self._lock:
+                self._inflight.discard(str(src))
 
     def _process(self, src: Path) -> None:
         try:
@@ -92,9 +113,12 @@ class _Handler(FileSystemEventHandler):
 class FolderMonitor:
     """Watch a folder (recursively) for new FLAC files and trigger conversion."""
 
-    def __init__(self, folder: str, on_files: Callable[[List[str]], None]):
+    def __init__(self, folder: str,
+                 on_files: Callable[[List[str]], None],
+                 on_torrents: Callable[[List[str]], None]):
         self._folder = folder
         self._on_files = on_files
+        self._on_torrents = on_torrents
         self._observer: Observer | None = None
         self._inflight: Set[str] = set()
         self._lock = threading.Lock()
@@ -103,7 +127,7 @@ class FolderMonitor:
         """Start watching. No-op if already running."""
         if self._observer is not None:
             return
-        handler = _Handler(self._on_files, self._inflight, self._lock)
+        handler = _Handler(self._on_files, self._on_torrents, self._inflight, self._lock)
         self._observer = Observer()
         self._observer.schedule(handler, self._folder, recursive=True)
         self._observer.start()

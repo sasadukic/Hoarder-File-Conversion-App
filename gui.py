@@ -895,7 +895,7 @@ class App(TkinterDnD.Tk):
             self._monitor_folder_var.set("")
             self._monitor_var.set(False)
             return
-        self._monitor = mmod.FolderMonitor(folder, self._on_monitor_files)
+        self._monitor = mmod.FolderMonitor(folder, self._on_monitor_files, lambda paths: None)
         try:
             self._monitor.start()
             self._scan_existing_files(folder)
