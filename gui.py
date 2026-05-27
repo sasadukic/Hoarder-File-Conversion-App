@@ -11,6 +11,8 @@ import winsound
 from tkinter import filedialog
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import shutil
+from torrent_downloader import TorrentDownloader
 
 import pystray
 from PIL import Image, ImageDraw
@@ -154,7 +156,7 @@ class App(TkinterDnD.Tk):
         ctk.set_window_scaling(1.0)
 
         self.title("Hoarder")
-        self.geometry("500x440")
+        self.geometry("500x520")
         self.resizable(False, False)
         self.configure(bg=BG)
 
@@ -173,6 +175,7 @@ class App(TkinterDnD.Tk):
         self._tray_icon = None
         self._is_converting = False
         self._conversion_queue: List[List[str]] = []
+        self._torrent_downloader: Optional[TorrentDownloader] = None
 
         self._preload_sounds()
         self._build_ui()
@@ -308,6 +311,57 @@ class App(TkinterDnD.Tk):
         )
         self._update_folder_display()
 
+        # --- Torrent row ---
+        self._torrent_var = tk.BooleanVar(value=s.get("torrent_enabled", False))
+        self._torrent_check = ctk.CTkCheckBox(
+            self, text="Auto-download torrents",
+            variable=self._torrent_var, command=self._on_torrent_toggle, **_ck,
+        )
+        self._torrent_check.place(x=16, y=360)
+
+        self._torrent_download_browse_btn = ctk.CTkButton(
+            self, text="Download…", font=("Silkscreen", 16),
+            width=94, height=28,
+            fg_color=DARK, hover_color=DARK,
+            text_color=LIGHT,
+            border_color=LIGHT, border_width=2,
+            corner_radius=0,
+            command=self._browse_torrent_download_folder,
+        )
+        self._torrent_download_browse_btn.place(x=200, y=360)
+
+        self._torrent_finished_browse_btn = ctk.CTkButton(
+            self, text="Finished…", font=("Silkscreen", 16),
+            width=94, height=28,
+            fg_color=DARK, hover_color=DARK,
+            text_color=LIGHT,
+            border_color=LIGHT, border_width=2,
+            corner_radius=0,
+            command=self._browse_torrent_finished_folder,
+        )
+        self._torrent_finished_browse_btn.place(x=300, y=360)
+
+        saved_dl = s.get("torrent_download_folder") or ""
+        saved_fin = s.get("torrent_finished_folder") or ""
+        self._torrent_download_var = tk.StringVar(value=saved_dl)
+        self._torrent_finished_var = tk.StringVar(value=saved_fin)
+        
+        self._torrent_delete_var = tk.BooleanVar(value=s.get("torrent_delete_source", False))
+        self._torrent_delete_check = ctk.CTkCheckBox(
+            self, text="Delete torrent file after adding",
+            variable=self._torrent_delete_var, **_ck,
+        )
+        self._torrent_delete_check.place(x=16, y=392)
+        
+        self._torrent_status_label = tk.Label(
+            self,
+            text="",
+            bg=BG, fg=DIM,
+            font=("Silkscreen", 8),
+            anchor="w", wraplength=0,
+        )
+        self._torrent_status_label.place(x=16, y=420, width=468, height=20)
+
         # ------------------------------------------------------------------
         # Convert button
         # ------------------------------------------------------------------
@@ -323,7 +377,7 @@ class App(TkinterDnD.Tk):
             text_color_disabled=DARK,
             corner_radius=0,
         )
-        self._convert_btn.place(x=16, y=374)
+        self._convert_btn.place(x=16, y=448)
 
         # Button wave overlay removed — button shows plain text during conversion
 
@@ -332,6 +386,8 @@ class App(TkinterDnD.Tk):
             self._delete_var, self._auto_convert_var,
             self._tray_var, self._startup_var,
             self._monitor_var, self._monitor_folder_var,
+            self._torrent_var, self._torrent_download_var,
+            self._torrent_finished_var, self._torrent_delete_var,
         ):
             var.trace_add("write", lambda *_: self._save_settings())
 
@@ -496,6 +552,10 @@ class App(TkinterDnD.Tk):
             "start_on_startup": self._startup_var.get(),
             "monitor_enabled": self._monitor_var.get(),
             "monitor_folder": self._monitor_folder_var.get() or None,
+            "torrent_enabled": self._torrent_var.get(),
+            "torrent_download_folder": self._torrent_download_var.get() or None,
+            "torrent_finished_folder": self._torrent_finished_var.get() or None,
+            "torrent_delete_source": self._torrent_delete_var.get(),
         })
 
     # ------------------------------------------------------------------
@@ -574,6 +634,26 @@ class App(TkinterDnD.Tk):
             # --- Video ---
             if videos:
                 transcode_videos(videos, on_video_progress, delete_source=do_delete)
+
+            # Copy converted files to finished folder
+            finished = self._torrent_finished_var.get()
+            if finished and Path(finished).is_dir():
+                outputs = []
+                if flacs:
+                    if cue:
+                        for track in parse_cue(cue):
+                            outputs.append(str(Path(flacs[0]).parent / f"{track.number:02d} - {track.title}.mp3"))
+                    else:
+                        for f in flacs:
+                            outputs.append(str(Path(f).parent / (Path(f).stem + ".mp3")))
+                for v in videos:
+                    src = Path(v)
+                    if src.suffix.lower() == ".mp4":
+                        outputs.append(str(src.parent / (src.stem + ".hevc.mp4")))
+                    else:
+                        outputs.append(str(src.parent / (src.stem + ".mp4")))
+                from converter import copy_to_finished
+                copy_to_finished(outputs, finished)
 
             # Done
             self.after(0, self._play_done)
@@ -889,13 +969,93 @@ class App(TkinterDnD.Tk):
             self._stop_monitor()
             self._start_monitor(folder)
 
+    def _on_torrent_toggle(self) -> None:
+        self._play_click()
+        if self._torrent_var.get():
+            self._start_torrent_downloader()
+        else:
+            self._stop_torrent_downloader()
+
+    def _browse_torrent_download_folder(self) -> None:
+        self._play_click()
+        folder = filedialog.askdirectory(title="Select torrent download folder")
+        if folder:
+            self._torrent_download_var.set(folder)
+            if self._torrent_var.get():
+                self._stop_torrent_downloader()
+                self._start_torrent_downloader()
+
+    def _browse_torrent_finished_folder(self) -> None:
+        self._play_click()
+        folder = filedialog.askdirectory(title="Select finished folder")
+        if folder:
+            self._torrent_finished_var.set(folder)
+
+    def _start_torrent_downloader(self) -> None:
+        self._stop_torrent_downloader()
+        dl = self._torrent_download_var.get()
+        if not dl:
+            self._set_status("Select a download folder", WARM)
+            self._torrent_var.set(False)
+            return
+        self._torrent_downloader = TorrentDownloader(
+            dl,
+            on_progress=self._on_torrent_progress,
+            on_complete=self._on_torrent_complete,
+        )
+        self._torrent_downloader.start()
+
+    def _stop_torrent_downloader(self) -> None:
+        if self._torrent_downloader:
+            self._torrent_downloader.stop()
+            self._torrent_downloader = None
+
+    def _on_torrent_progress(self, tid: str, name: str, progress: float) -> None:
+        if progress < 0:
+            self.after(0, self._set_status, f"Torrent error: {name}", WARM)
+        else:
+            pct = int(progress * 100)
+            self.after(0, self._set_status, f"Torrent: {name} {pct}%")
+
+    def _on_torrent_complete(self, tid: str, download_path: str) -> None:
+        monitor_folder = self._monitor_folder_var.get()
+        if monitor_folder and Path(monitor_folder).is_dir():
+            self._copy_downloaded_to_monitor(download_path, monitor_folder)
+        self.after(0, self._scan_and_convert_downloaded, download_path)
+
+    def _copy_downloaded_to_monitor(self, download_path: str, monitor_folder: str) -> None:
+        src = Path(download_path)
+        dst = Path(monitor_folder)
+        if not src.exists():
+            return
+        for ext in list(AUDIO_EXTS) + list(VIDEO_EXTS):
+            for f in src.rglob(f"*{ext}"):
+                try:
+                    shutil.copy2(str(f), str(dst / f.name))
+                except OSError:
+                    pass
+
+    def _scan_and_convert_downloaded(self, download_path: str) -> None:
+        paths = []
+        p = Path(download_path)
+        for ext in AUDIO_EXTS:
+            paths.extend(str(f) for f in p.rglob(f"*{ext}"))
+        for pat in ("*.mp4", "*.mkv", "*.mov", "*.wmv", "*.avi"):
+            paths.extend(str(f) for f in p.rglob(pat))
+        if paths:
+            self._enqueue_conversion(paths)
+
     def _start_monitor(self, folder: str) -> None:
         self._stop_monitor()
         if not Path(folder).is_dir():
             self._monitor_folder_var.set("")
             self._monitor_var.set(False)
             return
-        self._monitor = mmod.FolderMonitor(folder, self._on_monitor_files, lambda paths: None)
+        self._monitor = mmod.FolderMonitor(
+            folder, 
+            self._on_monitor_files,
+            self._on_torrent_files,
+        )
         try:
             self._monitor.start()
             self._scan_existing_files(folder)
@@ -1023,6 +1183,21 @@ class App(TkinterDnD.Tk):
         """Called from watchdog thread when new files arrive - marshal to main thread."""
         self.after(0, self._enqueue_conversion, paths)
 
+    def _on_torrent_files(self, paths: List[str]) -> None:
+        """Called from watchdog thread when torrent files arrive."""
+        if not self._torrent_var.get() or not self._torrent_downloader:
+            return
+        self.after(0, self._process_torrent_files, paths)
+
+    def _process_torrent_files(self, paths: List[str]) -> None:
+        for path in paths:
+            self._torrent_downloader.add(path)
+            if self._torrent_delete_var.get():
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
     def _load_and_auto_convert(self, paths: List[str]) -> None:
         """Queue files for conversion (kept for compatibility; delegates to queue)."""
         self._enqueue_conversion(paths)
@@ -1032,6 +1207,7 @@ class App(TkinterDnD.Tk):
     # ------------------------------------------------------------------
     def destroy(self) -> None:
         self._stop_monitor()
+        self._stop_torrent_downloader()
         if self._tray_icon is not None:
             try:
                 self._tray_icon.stop()
