@@ -1,6 +1,15 @@
 import pytest
 from pathlib import Path
-from gui import detect_mode, parse_drop_paths, expand_drops, MODE_SPLIT, MODE_CONVERT, MODE_VIDEO, MODE_MIXED
+from gui import (
+    detect_mode,
+    parse_drop_paths,
+    expand_drops,
+    format_torrent_name,
+    MODE_SPLIT,
+    MODE_CONVERT,
+    MODE_VIDEO,
+    MODE_MIXED,
+)
 
 
 # --- detect_mode ---
@@ -172,6 +181,14 @@ def test_expand_drops_includes_video_extensions(tmp_path):
     assert str(tmp_path / "clip.mkv") in result
     assert str(tmp_path / "audio.flac") in result
     assert not any("cover.jpg" in r for r in result)
+
+
+def test_format_torrent_name_strips_dots_dashes_and_truncates():
+    result = format_torrent_name("AB.CD - EF.GH IJ.KL MN.OP QR")
+    assert result == "ABCD  EFGH IJKL MNOP"
+    assert len(result) == 20
+    assert "." not in result
+    assert "-" not in result
 
 
 # --- parse_drop_paths ---

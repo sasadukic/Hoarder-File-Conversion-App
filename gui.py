@@ -53,6 +53,11 @@ GOLD  = LIGHT   # in-progress
 WARM  = LIGHT   # warnings / errors
 
 
+def format_torrent_name(name: str, limit: int = 20) -> str:
+    cleaned = name.replace(".", "").replace("-", "")
+    return cleaned[:limit]
+
+
 def detect_mode(
     paths: List[str],
 ) -> Tuple[Optional[str], List[str], Optional[str], List[str], Optional[str]]:
@@ -1202,9 +1207,9 @@ class App(TkinterDnD.Tk):
     def _add_torrent_progress_row(self, tid: str, name: str) -> None:
         frame = tk.Frame(self._torrent_progress_frame, bg=DARK)
         frame.pack(fill="x", padx=2, pady=1)
-        short_name = name if len(name) <= 25 else name[:22] + "..."
+        short_name = format_torrent_name(name)
         name_lbl = tk.Label(frame, text=short_name, bg=DARK, fg=SAGE,
-                            font=("Silkscreen", 8), anchor="w", width=200)
+                            font=("Silkscreen", 8), anchor="w", width=20)
         name_lbl.pack(side="left")
         bar = ctk.CTkProgressBar(frame, width=180, height=14)
         bar.set(0)
