@@ -346,3 +346,35 @@ def test_split_torrent_paths_no_torrents():
     torrents, others = split_torrent_paths(["/m/a.flac", "/m/a.cue"])
     assert torrents == []
     assert others == ["/m/a.flac", "/m/a.cue"]
+
+
+# --- collect_media ---
+
+from gui import collect_media
+
+
+def test_collect_media_accepts_a_single_file(tmp_path):
+    """A single-file torrent completes to a file path, not a directory."""
+    f = tmp_path / "movie.mkv"
+    f.write_bytes(b"x")
+    assert collect_media(str(f)) == [str(f)]
+
+
+def test_collect_media_ignores_a_non_media_file(tmp_path):
+    f = tmp_path / "readme.nfo"
+    f.write_bytes(b"x")
+    assert collect_media(str(f)) == []
+
+
+def test_collect_media_walks_a_directory(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "01.flac").write_bytes(b"x")
+    (tmp_path / "movie.mp4").write_bytes(b"x")
+    (tmp_path / "notes.txt").write_bytes(b"x")
+
+    found = {Path(p).name for p in collect_media(str(tmp_path))}
+    assert found == {"01.flac", "movie.mp4"}
+
+
+def test_collect_media_missing_path_is_empty(tmp_path):
+    assert collect_media(str(tmp_path / "gone")) == []

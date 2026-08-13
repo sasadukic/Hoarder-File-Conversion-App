@@ -6,6 +6,7 @@ import time
 from torrent_downloader import (
     _try_import_libtorrent,
     _find_aria2c,
+    _completion_path,
     TorrentDownloader,
     _LOCAL_ARIA2C,
     _NO_WINDOW,
@@ -407,3 +408,89 @@ def test_aria2c_stdout_merges_stderr(tmp_path):
             cmd = mock_popen.call_args[0][0]
             assert "--summary-interval=1" in cmd
             td.stop()
+
+
+def test_aria2c_multifile_completes_with_common_parent(tmp_path):
+    """A multi-file torrent reports several FILE: lines; completion must hand
+    back the directory containing them, not just the last file."""
+    magnet_file = tmp_path / "test.magnet"
+    magnet_file.write_text("magnet:?xt=urn:btih:123&dn=Album", encoding="utf-8")
+
+    complete_calls = []
+
+    stdout_lines = [
+        b"[#2089b0 1MiB/33MiB(3%) CN:1 DL:115KiB ETA:4m51s]\n",
+        b"FILE: /downloads/Album/01.flac\n",
+        b"FILE: /downloads/Album/02.flac\n",
+        # aria2c repeats the FILE: block every summary interval
+        b"[#2089b0 33MiB/33MiB(100%) CN:1 DL:1MiB]\n",
+        b"FILE: /downloads/Album/01.flac\n",
+        b"FILE: /downloads/Album/02.flac\n",
+    ]
+
+    mock_proc = MagicMock()
+    mock_proc.stdout = iter(stdout_lines)
+    mock_proc.wait.return_value = 0
+
+    with patch("torrent_downloader._find_aria2c", return_value="/fake/aria2c"):
+        with patch("torrent_downloader.subprocess.Popen", return_value=mock_proc):
+            td = TorrentDownloader(
+                str(tmp_path), lambda t, n, p: None,
+                lambda t, p: complete_calls.append((t, p)),
+            )
+            td.start()
+            tid = td.add(str(magnet_file))
+            time.sleep(0.3)
+
+            assert len(complete_calls) == 1
+            assert complete_calls[0][0] == tid
+            assert Path(complete_calls[0][1]).as_posix() == "/downloads/Album"
+            td.stop()
+
+
+def test_aria2c_progress_ignores_non_summary_lines(tmp_path):
+    """Only the aggregate '[#gid ...]' line drives progress — per-file and
+    incidental percentages must not move the bar."""
+    magnet_file = tmp_path / "test.magnet"
+    magnet_file.write_text("magnet:?xt=urn:btih:123&dn=Album", encoding="utf-8")
+
+    progress_calls = []
+
+    stdout_lines = [
+        b"[#2089b0 1MiB/33MiB(3%) CN:1 DL:115KiB ETA:4m51s]\n",
+        b"FILE: /downloads/Album/01.flac (99%)\n",
+        b"Exception: seeding finished (100%)\n",
+    ]
+
+    mock_proc = MagicMock()
+    mock_proc.stdout = iter(stdout_lines)
+    mock_proc.wait.return_value = 0
+
+    with patch("torrent_downloader._find_aria2c", return_value="/fake/aria2c"):
+        with patch("torrent_downloader.subprocess.Popen", return_value=mock_proc):
+            td = TorrentDownloader(
+                str(tmp_path), lambda t, n, p: progress_calls.append(p),
+                lambda t, p: None,
+            )
+            td.start()
+            td.add(str(magnet_file))
+            time.sleep(0.3)
+
+            # 0.0 on spawn, 0.03 from the summary line, 1.0 on completion.
+            assert progress_calls == [0.0, 0.03, 1.0]
+            td.stop()
+
+
+# --- _completion_path ---
+
+def test_completion_path_single_file_is_the_file():
+    assert _completion_path(["/d/movie.mkv"]) == "/d/movie.mkv"
+
+
+def test_completion_path_many_files_is_common_parent():
+    result = _completion_path(["/d/Album/01.flac", "/d/Album/02.flac"])
+    assert Path(result).as_posix() == "/d/Album"
+
+
+def test_completion_path_empty_is_none():
+    assert _completion_path([]) is None

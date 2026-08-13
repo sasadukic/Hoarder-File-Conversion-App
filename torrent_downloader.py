@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 def _try_import_libtorrent():
     try:
@@ -19,8 +19,12 @@ def _try_import_libtorrent():
 _LOCAL_ARIA2C = Path(__file__).parent / "bin" / "aria2c.exe"
 
 # aria2c summary lines look like:  [#2089b0 400KiB/33MiB(1%) CN:1 DL:115KiB ETA:4m51s]
-# followed by:                     FILE: C:\downloads\movie.mkv
-_ARIA2_PCT_RE = re.compile(r"\((\d{1,3}(?:\.\d+)?)%\)")
+# followed by one per file:        FILE: C:\downloads\movie.mkv
+#
+# Anchor the percentage to the aggregate "[#gid ...]" line — a bare "(n%)"
+# search also matches per-file lines, which makes the bar jump around on
+# multi-file torrents.
+_ARIA2_PCT_RE = re.compile(r"^\[#[0-9a-fA-F]+\b.*?\((\d{1,3}(?:\.\d+)?)%\)")
 _ARIA2_FILE_RE = re.compile(r"^FILE:\s*(.+?)\s*$")
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -29,6 +33,22 @@ def _find_aria2c() -> Optional[str]:
     if _LOCAL_ARIA2C.exists():
         return str(_LOCAL_ARIA2C)
     return shutil.which("aria2c")
+
+def _completion_path(file_paths: List[str]) -> Optional[str]:
+    """Most specific path containing every entry in *file_paths*.
+
+    A single file yields that file; several yield their common parent
+    directory. Returns None when the list is empty or the paths cannot share
+    a root (e.g. different drives).
+    """
+    if not file_paths:
+        return None
+    if len(file_paths) == 1:
+        return file_paths[0]
+    try:
+        return os.path.commonpath(file_paths)
+    except ValueError:
+        return None
 
 def _extract_magnet_name(uri: str) -> Optional[str]:
     match = re.search(r"dn=([^&]+)", uri)
@@ -198,7 +218,9 @@ class TorrentDownloader:
     def _spawn_aria2c_monitor(self, tid: str, proc: subprocess.Popen, name: str) -> None:
         def _monitor():
             rc = -1
-            file_path: Optional[str] = None
+            # aria2c repeats its FILE: lines every summary interval, so
+            # collect them in order without duplicates.
+            file_paths: List[str] = []
             try:
                 # Drain stdout (progress summaries). Without this the pipe
                 # buffer fills up and aria2c stalls on larger downloads.
@@ -209,9 +231,11 @@ class TorrentDownloader:
                         line = line.strip()
                         m = _ARIA2_FILE_RE.match(line)
                         if m:
-                            file_path = m.group(1)
+                            fp = m.group(1)
+                            if fp not in file_paths:
+                                file_paths.append(fp)
                             continue
-                        m = _ARIA2_PCT_RE.search(line)
+                        m = _ARIA2_PCT_RE.match(line)
                         if m:
                             pct = min(float(m.group(1)) / 100.0, 1.0)
                             if pct != last_pct:
@@ -226,8 +250,10 @@ class TorrentDownloader:
             if rc == 0:
                 self._progress[tid] = 1.0
                 self.on_progress(tid, name, 1.0)
-                # Prefer the actual path aria2c reported; fall back to a guess.
-                download_path = file_path or os.path.join(self.download_dir, name)
+                # Prefer the actual paths aria2c reported; fall back to a guess.
+                download_path = _completion_path(file_paths) or os.path.join(
+                    self.download_dir, name
+                )
                 self.on_complete(tid, download_path)
             else:
                 self._progress[tid] = -1.0

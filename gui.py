@@ -69,6 +69,25 @@ GOLD  = LIGHT   # in-progress
 WARM  = LIGHT   # warnings / errors
 
 
+def collect_media(root: str) -> List[str]:
+    """Audio and video files under *root*.
+
+    *root* may be a directory (searched recursively) or a single file — a
+    completed torrent is either, depending on whether it held one file or
+    many.
+    """
+    p = Path(root)
+    exts = set(AUDIO_EXTS) | VIDEO_EXTS
+    if p.is_file():
+        return [str(p)] if p.suffix.lower() in exts else []
+    if not p.is_dir():
+        return []
+    return [
+        str(f) for f in sorted(p.rglob("*"))
+        if f.is_file() and f.suffix.lower() in exts
+    ]
+
+
 def format_torrent_name(name: str, limit: int = 20) -> str:
     cleaned = name.replace(".", "").replace("-", "")
     return cleaned[:limit]
@@ -1354,24 +1373,16 @@ class App(TkinterDnD.Tk):
             self._remove_encoding_progress(task_id)
 
     def _copy_downloaded_to_monitor(self, download_path: str, monitor_folder: str) -> None:
-        src = Path(download_path)
         dst = Path(monitor_folder)
-        if not src.exists():
-            return
-        for ext in list(AUDIO_EXTS) + list(VIDEO_EXTS):
-            for f in src.rglob(f"*{ext}"):
-                try:
-                    shutil.copy2(str(f), str(dst / f.name))
-                except OSError:
-                    pass
+        for f in collect_media(download_path):
+            src = Path(f)
+            try:
+                shutil.copy2(str(src), str(dst / src.name))
+            except OSError:
+                pass  # includes copying a file onto itself
 
     def _scan_and_convert_downloaded(self, download_path: str) -> None:
-        paths = []
-        p = Path(download_path)
-        for ext in AUDIO_EXTS:
-            paths.extend(str(f) for f in p.rglob(f"*{ext}"))
-        for pat in ("*.mp4", "*.mkv", "*.mov", "*.wmv", "*.avi"):
-            paths.extend(str(f) for f in p.rglob(pat))
+        paths = collect_media(download_path)
         if paths:
             self._enqueue_conversion(paths)
 
