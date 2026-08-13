@@ -608,3 +608,26 @@ def test_copy_to_finished_multiple_files(tmp_path):
     assert result is None
     assert (finished / "a.mp3").exists()
     assert (finished / "b.mp3").exists()
+
+
+# --- video_output_path ---
+
+from converter import video_output_path
+
+
+def test_video_output_path_non_mp4_becomes_mp4():
+    assert video_output_path(Path("/m/movie.mkv")).name == "movie.mp4"
+
+
+def test_video_output_path_mp4_gains_hevc_infix():
+    """An .mp4 source must not be overwritten by its own transcode."""
+    assert video_output_path(Path("/m/movie.mp4")).name == "movie.hevc.mp4"
+
+
+def test_video_output_path_is_case_insensitive_on_suffix():
+    assert video_output_path(Path("/m/movie.MP4")).name == "movie.hevc.mp4"
+
+
+def test_video_output_path_stays_beside_source():
+    out = video_output_path(Path("/m/sub/movie.mkv"))
+    assert out.parent == Path("/m/sub")

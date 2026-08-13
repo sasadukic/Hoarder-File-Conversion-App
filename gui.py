@@ -1,6 +1,7 @@
 import array
 import io
 import math
+import os
 import sys
 import tempfile
 import winreg
@@ -24,7 +25,7 @@ from tkinterdnd2 import TkinterDnD, DND_FILES
 from cue_parser import parse_cue, cue_file_ref
 from converter import (
     AUDIO_EXTS, check_ffmpeg, split_and_convert, convert_files,
-    delete_flacs, delete_companion_files, transcode_videos,
+    delete_flacs, delete_companion_files, transcode_videos, video_output_path,
 )
 import settings as smod
 import monitor as mmod
@@ -217,6 +218,10 @@ class App(TkinterDnD.Tk):
         self._is_converting = False
         self._conversion_queue: List[List[str]] = []
         self._torrent_downloader: Optional[TorrentDownloader] = None
+        # Files this app is about to write into the monitored folder. The
+        # watcher skips them so a transcode does not re-enter the queue.
+        self._ignore_paths: set[str] = set()
+        self._ignore_lock = threading.Lock()
 
         self._preload_sounds()
         self._build_ui()
@@ -305,17 +310,30 @@ class App(TkinterDnD.Tk):
         # ------------------------------------------------------------------
         # Downloads tab — torrent progress list
         # ------------------------------------------------------------------
+        # Both progress lists scroll: a large monitored folder registers one
+        # row per file, which would otherwise render off the bottom of the tab.
+        _scroll = dict(
+            fg_color=BG, corner_radius=0,
+            scrollbar_fg_color=BG,
+            scrollbar_button_color=LIGHT,
+            scrollbar_button_hover_color=LIGHT,
+        )
+
         dl_tab = self._tabview.tab("Downloads")
-        self._torrent_progress_frame = tk.Frame(dl_tab, bg=BG)
-        self._torrent_progress_frame.place(x=0, y=0, width=452, height=440)
+        self._torrent_progress_frame = ctk.CTkScrollableFrame(
+            dl_tab, width=416, height=416, **_scroll,
+        )
+        self._torrent_progress_frame.place(x=0, y=0)
         self._torrent_progress_widgets: Dict[str, dict] = {}
 
         # ------------------------------------------------------------------
         # Encoding tab — conversion progress list
         # ------------------------------------------------------------------
         enc_tab = self._tabview.tab("Encoding")
-        self._encoding_progress_frame = tk.Frame(enc_tab, bg=BG)
-        self._encoding_progress_frame.place(x=0, y=0, width=452, height=440)
+        self._encoding_progress_frame = ctk.CTkScrollableFrame(
+            enc_tab, width=416, height=416, **_scroll,
+        )
+        self._encoding_progress_frame.place(x=0, y=0)
         self._encoding_progress_widgets: Dict[str, dict] = {}
 
         # ------------------------------------------------------------------
@@ -417,7 +435,7 @@ class App(TkinterDnD.Tk):
         self._torrent_delete_var = tk.BooleanVar(value=s.get("torrent_delete_source", False))
         self._torrent_delete_check = ctk.CTkCheckBox(
             setup_tab, text="Delete torrent file after adding",
-            variable=self._torrent_delete_var, **_ck,
+            variable=self._torrent_delete_var, command=self._play_click, **_ck,
         )
         self._torrent_delete_check.place(x=0, y=272)
 
@@ -661,7 +679,6 @@ class App(TkinterDnD.Tk):
         self._mode = mode
         self._video_paths = videos
 
-        names = ", ".join(Path(p).name for p in paths)  # noqa: F841
         self._set_info("Files loaded", SAGE)
         self._convert_btn.configure(state="normal", text="Convert")
 
@@ -671,8 +688,13 @@ class App(TkinterDnD.Tk):
     # ------------------------------------------------------------------
     # Status / settings
     # ------------------------------------------------------------------
-    def _set_status(self, text: str, color: str = GREEN) -> None:
-        """Update the convert button text."""
+    def _set_status(self, text: str) -> None:
+        """Update the convert button text.
+
+        Deliberately colourless: the button is a LIGHT fill with DARK text, so
+        there is no second text colour available for it under the two-colour
+        palette. Use _set_info() when a message needs to read as a warning.
+        """
         self._convert_btn.configure(text=text)
         self.update_idletasks()
 
@@ -776,6 +798,10 @@ class App(TkinterDnD.Tk):
 
             # --- Video ---
             if videos:
+                # Claim the outputs before ffmpeg writes them, so the folder
+                # monitor does not treat them as newly arrived source files.
+                for v in videos:
+                    self._ignore_output(str(video_output_path(Path(v))))
                 transcode_videos(videos, on_video_progress, delete_source=do_delete)
 
             # Copy converted files to finished folder
@@ -790,11 +816,10 @@ class App(TkinterDnD.Tk):
                         for f in flacs:
                             outputs.append(str(Path(f).parent / (Path(f).stem + ".mp3")))
                 for v in videos:
-                    src = Path(v)
-                    if src.suffix.lower() == ".mp4":
-                        outputs.append(str(src.parent / (src.stem + ".hevc.mp4")))
-                    else:
-                        outputs.append(str(src.parent / (src.stem + ".mp4")))
+                    outputs.append(str(video_output_path(Path(v))))
+                # The finished folder may sit inside the monitored tree.
+                for o in outputs:
+                    self._ignore_output(str(Path(finished) / Path(o).name))
                 from converter import copy_to_finished
                 copy_to_finished(outputs, finished)
 
@@ -957,7 +982,7 @@ class App(TkinterDnD.Tk):
             self._tray_icon.run_detached()
         except Exception as e:
             self._tray_var.set(False)
-            self._set_status(f"Tray error: {e}", WARM)
+            self._set_status(f"Tray error: {e}")
         finally:
             self._hiding_to_tray = False
 
@@ -968,7 +993,7 @@ class App(TkinterDnD.Tk):
             self._tray_icon.run_detached()
         except Exception as e:
             self._tray_var.set(False)
-            self._set_status(f"Tray error: {e}", WARM)
+            self._set_status(f"Tray error: {e}")
 
     def _build_tray_icon(self) -> pystray.Icon:
         """Create a tray icon, using hoarder.ico if available."""
@@ -1131,7 +1156,7 @@ class App(TkinterDnD.Tk):
             else:
                 self._unregister_magnet_handler()
         except OSError as e:
-            self._set_status(f"Magnet handler error: {e}", WARM)
+            self._set_status(f"Magnet handler error: {e}")
             self._magnet_handler_var.set(not self._magnet_handler_var.get())
 
     @staticmethod
@@ -1228,7 +1253,9 @@ class App(TkinterDnD.Tk):
             ) as key:
                 val, _ = winreg.QueryValueEx(key, "magnet")
                 return val == "magnet"
-        except FileNotFoundError:
+        except OSError:
+            # Runs during _build_ui — a permissions error here must not take
+            # the whole app down before the window appears.
             return False
 
     def _handle_magnet_link(self, magnet_uri: str) -> None:
@@ -1238,7 +1265,7 @@ class App(TkinterDnD.Tk):
             self._start_torrent_downloader()
         if self._torrent_downloader:
             self._torrent_downloader.add(magnet_uri)
-            self._set_status(f"Added magnet link")
+            self._set_status("Added magnet link")
 
     def _browse_torrent_download_folder(self) -> None:
         self._play_click()
@@ -1259,7 +1286,7 @@ class App(TkinterDnD.Tk):
         self._stop_torrent_downloader()
         dl = self._torrent_download_var.get()
         if not dl:
-            self._set_status("Select a download folder", WARM)
+            self._set_status("Select a download folder")
             self._torrent_var.set(False)
             return
         self._torrent_downloader = TorrentDownloader(
@@ -1401,7 +1428,7 @@ class App(TkinterDnD.Tk):
             self._monitor.start()
             self._scan_existing_files(folder)
         except Exception as e:
-            self._set_status(f"Monitor error: {e}", WARM)
+            self._set_status(f"Monitor error: {e}")
             self._monitor_var.set(False)
             self._monitor = None
 
@@ -1520,8 +1547,36 @@ class App(TkinterDnD.Tk):
             self._monitor.stop()
             self._monitor = None
 
+    # ------------------------------------------------------------------
+    # Self-produced output suppression
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _ignore_key(path: str) -> str:
+        return os.path.normcase(os.path.abspath(path))
+
+    def _ignore_output(self, path: str) -> None:
+        """Mark *path* as this app's own output so the watcher skips it once."""
+        with self._ignore_lock:
+            self._ignore_paths.add(self._ignore_key(path))
+
+    def _claim_ignored(self, path: str) -> bool:
+        """True if *path* was a registered output; consumes the registration.
+
+        One-shot so a file the user later drops in under the same name is
+        still converted normally.
+        """
+        key = self._ignore_key(path)
+        with self._ignore_lock:
+            if key in self._ignore_paths:
+                self._ignore_paths.discard(key)
+                return True
+        return False
+
     def _on_monitor_files(self, paths: List[str]) -> None:
         """Called from watchdog thread when new files arrive - marshal to main thread."""
+        paths = [p for p in paths if not self._claim_ignored(p)]
+        if not paths:
+            return
         self.after(0, self._enqueue_conversion, paths)
 
     def _on_torrent_files(self, paths: List[str]) -> None:

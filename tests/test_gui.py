@@ -378,3 +378,68 @@ def test_collect_media_walks_a_directory(tmp_path):
 
 def test_collect_media_missing_path_is_empty(tmp_path):
     assert collect_media(str(tmp_path / "gone")) == []
+
+
+# --- self-produced output suppression ---
+#
+# Exercises App's real methods against a stand-in holding just the state they
+# touch, so no Tk root (and no display) is needed.
+
+import threading
+
+from gui import App
+
+
+class _IgnoreHost:
+    """Minimal stand-in carrying only what the ignore-set methods use."""
+
+    # staticmethod() re-wraps it — a bare assignment would rebind it as an
+    # instance method and pass self as the path.
+    _ignore_key = staticmethod(App._ignore_key)
+    _ignore_output = App._ignore_output
+    _claim_ignored = App._claim_ignored
+    _on_monitor_files = App._on_monitor_files
+
+    def __init__(self):
+        self._ignore_paths = set()
+        self._ignore_lock = threading.Lock()
+        self.enqueued = []
+
+    def _enqueue_conversion(self, paths):
+        self.enqueued.append(paths)
+
+    def after(self, _delay, fn, paths):
+        fn(paths)
+
+
+def test_registered_output_is_skipped_once():
+    host = _IgnoreHost()
+    host._ignore_output(str(Path.cwd() / "movie.mp4"))
+
+    # The transcode's own output must not re-enter the queue...
+    host._on_monitor_files([str(Path.cwd() / "movie.mp4")])
+    assert host.enqueued == []
+
+    # ...but the same name arriving again later is a genuine new file.
+    host._on_monitor_files([str(Path.cwd() / "movie.mp4")])
+    assert host.enqueued == [[str(Path.cwd() / "movie.mp4")]]
+
+
+def test_unregistered_files_still_convert():
+    host = _IgnoreHost()
+    host._on_monitor_files(["/m/album.flac", "/m/album.cue"])
+    assert host.enqueued == [["/m/album.flac", "/m/album.cue"]]
+
+
+def test_ignore_survives_path_spelling():
+    """Watchdog and ffmpeg can spell the same file differently."""
+    host = _IgnoreHost()
+    host._ignore_output(str(Path.cwd() / "sub" / ".." / "movie.mp4"))
+    assert host._claim_ignored(str(Path.cwd() / "movie.mp4")) is True
+
+
+def test_ignored_path_does_not_suppress_its_siblings():
+    host = _IgnoreHost()
+    host._ignore_output(str(Path.cwd() / "a.mp4"))
+    host._on_monitor_files([str(Path.cwd() / "a.mp4"), str(Path.cwd() / "b.mp4")])
+    assert host.enqueued == [[str(Path.cwd() / "b.mp4")]]

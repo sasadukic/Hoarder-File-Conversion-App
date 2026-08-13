@@ -39,6 +39,16 @@ def _ffprobe_exe() -> str:
     return "ffprobe"
 
 
+def video_output_path(src: Path) -> Path:
+    """Destination for a transcode of *src*.
+
+    An .mp4 source gains a .hevc infix so the transcode never overwrites it.
+    """
+    if src.suffix.lower() == ".mp4":
+        return src.parent / (src.stem + ".hevc.mp4")
+    return src.parent / (src.stem + ".mp4")
+
+
 def probe_video(path: str) -> dict:
     """Probe a video file and return {codec, duration, size}.
 
@@ -144,11 +154,7 @@ def transcode_videos(
             progress_callback(i, total)
             continue
 
-        # Determine output path (avoid overwriting source if already .mp4)
-        if src.suffix.lower() == ".mp4":
-            out = src.parent / (src.stem + ".hevc.mp4")
-        else:
-            out = src.parent / (src.stem + ".mp4")
+        out = video_output_path(src)
 
         # --- Size check: transcode a short sample ---
         sample_duration = min(duration, 30.0) if duration > 0 else 30.0

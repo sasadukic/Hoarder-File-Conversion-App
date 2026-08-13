@@ -102,21 +102,28 @@ class TorrentDownloader:
         if self._poll_thread is not None:
             self._poll_thread.join(timeout=5)
             self._poll_thread = None
+        # Take the collections under the lock before touching them — the poll
+        # loop and the aria2c monitor threads mutate both as torrents finish.
+        with self._lock:
+            handles = list(self._handles.values())
+            procs = list(self._aria2c_procs.values())
+            self._handles.clear()
+            self._aria2c_procs.clear()
+            self._progress.clear()
+            self._names.clear()
         if self._session is not None:
-            for handle in list(self._handles.values()):
-                self._session.remove_torrent(handle)
+            for handle in handles:
+                try:
+                    self._session.remove_torrent(handle)
+                except Exception:
+                    pass
             self._session = None
-        for proc in list(self._aria2c_procs.values()):
+        for proc in procs:
             try:
                 proc.terminate()
                 proc.wait(timeout=5)
             except Exception:
                 pass
-        with self._lock:
-            self._handles.clear()
-            self._aria2c_procs.clear()
-            self._progress.clear()
-            self._names.clear()
 
     def add(self, path: str) -> Optional[str]:
         if not self._running:
@@ -240,15 +247,18 @@ class TorrentDownloader:
                             pct = min(float(m.group(1)) / 100.0, 1.0)
                             if pct != last_pct:
                                 last_pct = pct
-                                self._progress[tid] = pct
+                                with self._lock:
+                                    self._progress[tid] = pct
+                                # Callback outside the lock — it marshals into
+                                # the Tk thread and must never block a stop().
                                 self.on_progress(tid, name, pct)
                 rc = proc.wait()
             except Exception:
                 pass
             with self._lock:
                 self._aria2c_procs.pop(tid, None)
+                self._progress[tid] = 1.0 if rc == 0 else -1.0
             if rc == 0:
-                self._progress[tid] = 1.0
                 self.on_progress(tid, name, 1.0)
                 # Prefer the actual paths aria2c reported; fall back to a guess.
                 download_path = _completion_path(file_paths) or os.path.join(
@@ -256,7 +266,6 @@ class TorrentDownloader:
                 )
                 self.on_complete(tid, download_path)
             else:
-                self._progress[tid] = -1.0
                 self.on_progress(tid, name, -1.0)
 
         t = threading.Thread(target=_monitor, daemon=True)
@@ -270,16 +279,17 @@ class TorrentDownloader:
                 if handle.is_valid():
                     status = handle.status()
                     progress = status.progress
-                    name = status.name or self._names.get(tid, "")
-                    self._progress[tid] = progress
+                    with self._lock:
+                        name = status.name or self._names.get(tid, "")
+                        self._progress[tid] = progress
                     self.on_progress(tid, name, progress)
                     if status.is_seeding or status.is_finished:
                         download_path = os.path.join(self.download_dir, name)
                         self.on_complete(tid, download_path)
                         with self._lock:
                             self._handles.pop(tid, None)
-                        self._progress.pop(tid, None)
-                        self._names.pop(tid, None)
+                            self._progress.pop(tid, None)
+                            self._names.pop(tid, None)
 
     def _poll_loop(self) -> None:
         while self._running:
