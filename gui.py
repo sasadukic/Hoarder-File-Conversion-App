@@ -35,6 +35,22 @@ MODE_VIDEO  = "Video Transcode"
 MODE_MIXED  = "Mixed"
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".wmv", ".avi"}
+TORRENT_EXTS = {".torrent", ".magnet"}
+
+
+def split_torrent_paths(paths: List[str]) -> Tuple[List[str], List[str]]:
+    """Split *paths* into (torrent_paths, other_paths).
+
+    Torrent paths are .torrent/.magnet files and raw magnet:? URIs.
+    """
+    torrents: List[str] = []
+    others: List[str] = []
+    for p in paths:
+        if p.startswith("magnet:?") or Path(p).suffix.lower() in TORRENT_EXTS:
+            torrents.append(p)
+        else:
+            others.append(p)
+    return torrents, others
 
 # ---------------------------------------------------------------------------
 # Palette — two colors only
@@ -219,15 +235,16 @@ class App(TkinterDnD.Tk):
             text_color=LIGHT,
         )
         self._tabview.place(x=16, y=8)
+        self._tabview.configure(command=self._on_tab_changed)
         self._tabview._segmented_button.configure(
             font=("Silkscreen", 16),
-            text_color=DARK,
         )
 
         main_tab = self._tabview.add("Main")
         self._tabview.add("Downloads")
         self._tabview.add("Encoding")
         self._tabview.add("Setup")
+        self._update_tab_colors()
 
         # ------------------------------------------------------------------
         # Main tab — drop zone + file info + convert button
@@ -363,7 +380,7 @@ class App(TkinterDnD.Tk):
             text_color=LIGHT, border_color=LIGHT, border_width=2,
             corner_radius=0, command=self._browse_torrent_download_folder,
         )
-        self._torrent_download_browse_btn.place(x=200, y=204)
+        self._torrent_download_browse_btn.place(x=252, y=236)
 
         self._torrent_finished_browse_btn = ctk.CTkButton(
             setup_tab, text="Finished…", font=("Silkscreen", 16),
@@ -371,7 +388,7 @@ class App(TkinterDnD.Tk):
             text_color=LIGHT, border_color=LIGHT, border_width=2,
             corner_radius=0, command=self._browse_torrent_finished_folder,
         )
-        self._torrent_finished_browse_btn.place(x=300, y=204)
+        self._torrent_finished_browse_btn.place(x=352, y=236)
 
         saved_dl = s.get("torrent_download_folder") or ""
         saved_fin = s.get("torrent_finished_folder") or ""
@@ -383,14 +400,14 @@ class App(TkinterDnD.Tk):
             setup_tab, text="Delete torrent file after adding",
             variable=self._torrent_delete_var, **_ck,
         )
-        self._torrent_delete_check.place(x=0, y=236)
+        self._torrent_delete_check.place(x=0, y=272)
 
         self._magnet_handler_var = tk.BooleanVar(value=self._is_magnet_handler_registered())
         self._magnet_handler_check = ctk.CTkCheckBox(
             setup_tab, text="Open magnet links in Hoarder",
             variable=self._magnet_handler_var, command=self._on_magnet_handler_toggle, **_ck,
         )
-        self._magnet_handler_check.place(x=0, y=268)
+        self._magnet_handler_check.place(x=0, y=304)
 
         # --- Settings traces ---
         for var in (
@@ -410,8 +427,32 @@ class App(TkinterDnD.Tk):
             self._monitor_var.set(True)
             self._start_monitor(s["monitor_folder"])
 
+        # Restore torrent downloader state
+        if s.get("torrent_enabled") and s.get("torrent_download_folder"):
+            self._start_torrent_downloader()
+
         # Start animation loop
         self.after(40, self._wave_tick)
+
+    # ------------------------------------------------------------------
+    # Tab bar colors — keep unselected tab labels visible
+    # ------------------------------------------------------------------
+    def _on_tab_changed(self) -> None:
+        self._update_tab_colors()
+
+    def _update_tab_colors(self) -> None:
+        """Selected chip: DARK text on LIGHT bg; unselected: LIGHT text on DARK.
+
+        customtkinter's segmented button only supports a single text color for
+        all segments, so recolor the per-tab buttons directly.
+        """
+        try:
+            seg = self._tabview._segmented_button
+            selected = self._tabview.get()
+            for name, btn in seg._buttons_dict.items():
+                btn.configure(text_color=DARK if name == selected else LIGHT)
+        except Exception:
+            pass  # private API — never let a ctk change break the app
 
     # ------------------------------------------------------------------
     # Text truncation helpers — prevent UI overflow on status/info
@@ -465,7 +506,7 @@ class App(TkinterDnD.Tk):
     def _preload_sounds(self) -> None:
         self._sound_paths: Dict[str, str] = {}
         self._sound_tmp_dir = tempfile.mkdtemp(prefix="hoarder_snd_")
-        for name in ("Click.wav", "Done.wav"):
+        for name in ("Click.wav", "Done.wav", "Starting.wav"):
             p = Path(__file__).parent / name
             if p.exists():
                 try:
@@ -492,6 +533,9 @@ class App(TkinterDnD.Tk):
 
     def _play_done(self) -> None:
         self._play("Done.wav")
+
+    def _play_starting(self) -> None:
+        self._play("Starting.wav")
 
     # ------------------------------------------------------------------
     # Drop / browse
@@ -527,6 +571,13 @@ class App(TkinterDnD.Tk):
         For multi-disc drops (2+ CUE files), splits into per-disc batches and
         enqueues them so they run sequentially without blocking the UI.
         """
+        # Torrent files dropped on the drop zone go straight to the downloader
+        torrents, paths = split_torrent_paths(paths)
+        if torrents:
+            self._add_dropped_torrents(torrents)
+            if not paths:
+                return
+
         flacs = [p for p in paths if Path(p).suffix.lower() in AUDIO_EXTS]
         cues = [p for p in paths if p.lower().endswith(".cue")]
         videos = [p for p in paths if Path(p).suffix.lower() in VIDEO_EXTS]
@@ -553,6 +604,27 @@ class App(TkinterDnD.Tk):
         # Videos (rare with multi-disc audio, but handle gracefully)
         if videos:
             self._enqueue_conversion(videos)
+
+    def _add_dropped_torrents(self, torrents: List[str]) -> None:
+        """Send dropped .torrent/.magnet files to the torrent downloader."""
+        if self._torrent_downloader is None:
+            if self._torrent_download_var.get():
+                self._torrent_var.set(True)
+                self._start_torrent_downloader()
+            else:
+                self._set_info("Set a torrent Download folder in Setup first", WARM)
+                return
+        if self._torrent_downloader is None:
+            return
+        added = 0
+        for t in torrents:
+            if self._torrent_downloader.add(t) is not None:
+                added += 1
+        if added:
+            plural = "s" if added != 1 else ""
+            self._set_info(f"Added {added} torrent{plural}", SAGE)
+        else:
+            self._set_info("Could not add torrent", WARM)
 
     def _load_files(self, paths: List[str]) -> None:
         mode, flacs, cue, videos, error = detect_mode(paths)
@@ -615,6 +687,7 @@ class App(TkinterDnD.Tk):
 
         self._is_converting = True
         self._convert_btn.configure(state="disabled", text="Converting...")
+        self._play_starting()
 
         thread = threading.Thread(target=self._run_conversion, daemon=True)
         thread.start()
@@ -1232,9 +1305,16 @@ class App(TkinterDnD.Tk):
     def _on_torrent_complete_gui(self, tid: str, download_path: str) -> None:
         self._remove_torrent_progress(tid)
         monitor_folder = self._monitor_folder_var.get()
-        if monitor_folder and Path(monitor_folder).is_dir():
+        if (
+            self._monitor is not None
+            and monitor_folder
+            and Path(monitor_folder).is_dir()
+        ):
+            # The folder monitor picks up the copies and converts them —
+            # scanning the download folder too would convert everything twice.
             self._copy_downloaded_to_monitor(download_path, monitor_folder)
-        self._scan_and_convert_downloaded(download_path)
+        else:
+            self._scan_and_convert_downloaded(download_path)
 
     # ------------------------------------------------------------------
     # Encoding progress (Encoding tab)
@@ -1244,7 +1324,7 @@ class App(TkinterDnD.Tk):
         frame.pack(fill="x", padx=2, pady=1)
         short_name = name if len(name) <= 25 else name[:22] + "..."
         name_lbl = tk.Label(frame, text=short_name, bg=BG, fg=SAGE,
-                            font=("Silkscreen", 8), anchor="w", width=200)
+                            font=("Silkscreen", 8), anchor="w", width=25)
         name_lbl.pack(side="left")
         bar = ctk.CTkProgressBar(frame, width=180, height=14)
         bar.set(0)
@@ -1441,8 +1521,11 @@ class App(TkinterDnD.Tk):
 
     def _process_torrent_files(self, paths: List[str]) -> None:
         for path in paths:
-            self._torrent_downloader.add(path)
-            if self._torrent_delete_var.get():
+            if self._torrent_downloader is None:
+                return
+            tid = self._torrent_downloader.add(path)
+            # Only clean up the source file if the torrent was actually added.
+            if tid is not None and self._torrent_delete_var.get():
                 try:
                     Path(path).unlink(missing_ok=True)
                 except OSError:

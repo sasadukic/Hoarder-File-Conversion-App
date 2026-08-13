@@ -321,3 +321,28 @@ def test_pair_each_flac_used_once():
     assert len(pairs) == 1
     _, cue = pairs[0]
     assert cue.name == "track.cue"
+
+
+# --- split_torrent_paths ---
+
+from gui import split_torrent_paths
+
+
+def test_split_torrent_paths_separates_torrents():
+    torrents, others = split_torrent_paths(
+        ["/m/movie.torrent", "/m/album.flac", "/m/link.magnet"]
+    )
+    assert torrents == ["/m/movie.torrent", "/m/link.magnet"]
+    assert others == ["/m/album.flac"]
+
+
+def test_split_torrent_paths_magnet_uri():
+    torrents, others = split_torrent_paths(["magnet:?xt=urn:btih:abc&dn=X"])
+    assert torrents == ["magnet:?xt=urn:btih:abc&dn=X"]
+    assert others == []
+
+
+def test_split_torrent_paths_no_torrents():
+    torrents, others = split_torrent_paths(["/m/a.flac", "/m/a.cue"])
+    assert torrents == []
+    assert others == ["/m/a.flac", "/m/a.cue"]
