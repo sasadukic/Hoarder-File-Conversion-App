@@ -10,7 +10,7 @@ A Windows GUI tool for converting lossless audio (FLAC, ALAC, APE, etc.) to 320k
 - **CUE Splitting** — Split album FLACs by CUE sheet into individual tracks
 - **Video Transcoding** — MP4/MKV/MOV/AVI/WMV → H.265 MP4 with AAC audio (GPU-accelerated when available)
 - **Folder Monitor** — Watch a folder recursively; auto-convert new files as they arrive
-- **Torrent Auto-Download** — Drop `.torrent` or `.magnet` files into the monitored folder; they download automatically and convert when done
+- **Torrent Auto-Download** — Drop `.torrent` or `.magnet` files into the monitored folder (or straight onto the drop zone); they download automatically and convert when done
 - **System Tray** — Minimize to tray and run in the background
 - **Windows Startup** — Optionally start with Windows
 
@@ -69,7 +69,7 @@ Monitored Folder
 | Engine | Priority | Notes |
 |--------|----------|-------|
 | **libtorrent** | Primary | Fast, native Python bindings. Requires Python ≤3.13 (wheels not yet available for 3.14) |
-| **aria2c** | Fallback | Single binary, no Python dependency. Place `aria2c.exe` in `bin/aria2c.exe` or ensure it's on your PATH |
+| **aria2c** | Fallback | Single binary, no Python dependency. Live progress is parsed from its output. Place `aria2c.exe` in `bin/aria2c.exe` or ensure it's on your PATH |
 
 If libtorrent is not installed, Hoarder automatically falls back to aria2c.
 
