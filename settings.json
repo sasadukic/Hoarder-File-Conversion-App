@@ -3,6 +3,10 @@
   "auto_convert": true,
   "minimize_to_tray": true,
   "start_on_startup": false,
-  "monitor_enabled": false,
-  "monitor_folder": null
+  "monitor_enabled": true,
+  "monitor_folder": "C:/Users/psilo/Downloads",
+  "torrent_enabled": true,
+  "torrent_download_folder": "C:/Users/psilo/Downloads",
+  "torrent_finished_folder": null,
+  "torrent_delete_source": true
 }
