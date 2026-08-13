@@ -18,6 +18,11 @@ def _try_import_libtorrent():
 
 _LOCAL_ARIA2C = Path(__file__).parent / "bin" / "aria2c.exe"
 
+# aria2c summary lines look like:  [#2089b0 400KiB/33MiB(1%) CN:1 DL:115KiB ETA:4m51s]
+# followed by:                     FILE: C:\downloads\movie.mkv
+_ARIA2_PCT_RE = re.compile(r"\((\d{1,3}(?:\.\d+)?)%\)")
+_ARIA2_FILE_RE = re.compile(r"^FILE:\s*(.+?)\s*$")
+
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 def _find_aria2c() -> Optional[str]:
@@ -59,7 +64,16 @@ class TorrentDownloader:
         self._running = True
         if self._lt is not None:
             self._session = self._lt.session()
-            self._session.listen_on(6881, 6891)
+            try:
+                # libtorrent 2.x way
+                self._session.apply_settings(
+                    {"listen_interfaces": "0.0.0.0:6881,[::]:6881"}
+                )
+            except Exception:
+                try:
+                    self._session.listen_on(6881, 6891)  # legacy 1.x fallback
+                except Exception:
+                    pass
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()
 
@@ -165,11 +179,14 @@ class TorrentDownloader:
             self._progress.pop(tid, None)
             self.on_progress(tid, name, -1.0)
             return None
-        cmd = [aria2c, "--seed-time=0", "-d", self.download_dir, target]
+        cmd = [
+            aria2c, "--seed-time=0", "--summary-interval=1",
+            "-d", self.download_dir, target,
+        ]
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             creationflags=_NO_WINDOW,
         )
         with self._lock:
@@ -181,7 +198,26 @@ class TorrentDownloader:
     def _spawn_aria2c_monitor(self, tid: str, proc: subprocess.Popen, name: str) -> None:
         def _monitor():
             rc = -1
+            file_path: Optional[str] = None
             try:
+                # Drain stdout (progress summaries). Without this the pipe
+                # buffer fills up and aria2c stalls on larger downloads.
+                if proc.stdout is not None:
+                    last_pct = -1.0
+                    for raw in proc.stdout:
+                        line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+                        line = line.strip()
+                        m = _ARIA2_FILE_RE.match(line)
+                        if m:
+                            file_path = m.group(1)
+                            continue
+                        m = _ARIA2_PCT_RE.search(line)
+                        if m:
+                            pct = min(float(m.group(1)) / 100.0, 1.0)
+                            if pct != last_pct:
+                                last_pct = pct
+                                self._progress[tid] = pct
+                                self.on_progress(tid, name, pct)
                 rc = proc.wait()
             except Exception:
                 pass
@@ -190,7 +226,8 @@ class TorrentDownloader:
             if rc == 0:
                 self._progress[tid] = 1.0
                 self.on_progress(tid, name, 1.0)
-                download_path = os.path.join(self.download_dir, name)
+                # Prefer the actual path aria2c reported; fall back to a guess.
+                download_path = file_path or os.path.join(self.download_dir, name)
                 self.on_complete(tid, download_path)
             else:
                 self._progress[tid] = -1.0
@@ -215,6 +252,8 @@ class TorrentDownloader:
                         self.on_complete(tid, download_path)
                         with self._lock:
                             self._handles.pop(tid, None)
+                        self._progress.pop(tid, None)
+                        self._names.pop(tid, None)
 
     def _poll_loop(self) -> None:
         while self._running:

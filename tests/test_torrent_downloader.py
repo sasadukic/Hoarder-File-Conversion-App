@@ -340,3 +340,70 @@ def test_double_start_is_noop(tmp_path):
     td.start()
     assert td._poll_thread is thread1
     td.stop()
+
+
+# --- aria2c progress parsing ---
+
+def test_aria2c_progress_parsed_from_stdout(tmp_path):
+    """Progress summaries on aria2c stdout are parsed into on_progress calls,
+    and the FILE: line determines the completion path."""
+    magnet_file = tmp_path / "test.magnet"
+    magnet_file.write_text("magnet:?xt=urn:btih:123&dn=MyFile", encoding="utf-8")
+
+    progress_calls = []
+    complete_calls = []
+
+    stdout_lines = [
+        b"[#2089b0 400KiB/33MiB(1%) CN:1 DL:115KiB ETA:4m51s]\n",
+        b"FILE: /downloads/MyFile.mkv\n",
+        b"[#2089b0 16MiB/33MiB(50%) CN:1 DL:1.2MiB ETA:14s]\n",
+        b"(OK):download completed.\n",
+    ]
+
+    mock_proc = MagicMock()
+    mock_proc.stdout = iter(stdout_lines)
+    mock_proc.wait.return_value = 0
+
+    with patch("torrent_downloader._find_aria2c", return_value="/fake/aria2c"):
+        with patch("torrent_downloader.subprocess.Popen", return_value=mock_proc):
+            td = TorrentDownloader(
+                str(tmp_path),
+                lambda t, n, p: progress_calls.append((t, n, p)),
+                lambda t, p: complete_calls.append((t, p)),
+            )
+            td.start()
+            tid = td.add(str(magnet_file))
+            assert tid is not None
+            time.sleep(0.3)
+
+            pcts = [p[2] for p in progress_calls]
+            assert 0.01 in pcts
+            assert 0.5 in pcts
+            assert pcts[-1] == 1.0
+
+            assert len(complete_calls) == 1
+            assert complete_calls[0] == (tid, "/downloads/MyFile.mkv")
+
+            td.stop()
+
+
+def test_aria2c_stdout_merges_stderr(tmp_path):
+    """aria2c is spawned with stderr merged into stdout so neither pipe can
+    fill up and deadlock the download."""
+    import subprocess as sp
+    magnet_file = tmp_path / "test.magnet"
+    magnet_file.write_text("magnet:?xt=urn:btih:123&dn=Test", encoding="utf-8")
+
+    mock_proc = MagicMock()
+    mock_proc.stdout = iter([])
+    mock_proc.wait.return_value = 0
+
+    with patch("torrent_downloader._find_aria2c", return_value="/fake/aria2c"):
+        with patch("torrent_downloader.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            td = TorrentDownloader(str(tmp_path), lambda t, n, p: None, lambda t, p: None)
+            td.start()
+            td.add(str(magnet_file))
+            assert mock_popen.call_args[1].get("stderr") == sp.STDOUT
+            cmd = mock_popen.call_args[0][0]
+            assert "--summary-interval=1" in cmd
+            td.stop()
