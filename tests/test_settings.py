@@ -9,12 +9,20 @@ DEFAULTS = {
     "auto_convert": False,
     "minimize_to_tray": False,
     "start_on_startup": False,
+    "sounds_enabled": True,
     "monitor_enabled": False,
     "monitor_folder": None,
     "torrent_enabled": False,
-    "torrent_download_folder": None,
-    "torrent_finished_folder": None,
     "torrent_delete_source": False,
+    "move_music_enabled": False,
+    "move_music_folder": None,
+    "move_video_enabled": False,
+    "move_video_folder": None,
+    "proxy_enabled": False,
+    "proxy_host": None,
+    "proxy_port": None,
+    "proxy_username": None,
+    "proxy_password": None,
 }
 
 

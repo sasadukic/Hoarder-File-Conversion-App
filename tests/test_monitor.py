@@ -136,3 +136,43 @@ def test_ignores_non_media_non_torrent_files(tmp_path):
         assert len(received_torrents) == 0
     finally:
         m.stop()
+
+
+def test_excluded_dirname_is_never_processed(tmp_path):
+    """A file inside the excluded (torrent staging) subfolder must never
+    trigger conversion, no matter how long it sits there — this is what
+    keeps an in-progress download from being picked up before it's done."""
+    received = []
+    sub = tmp_path / ".hoarder-incoming"
+    sub.mkdir()
+    m = FolderMonitor(
+        str(tmp_path), lambda paths: received.append(paths), lambda paths: None,
+        exclude_dirname=".hoarder-incoming",
+    )
+    m.start()
+    try:
+        flac = sub / "still-downloading.flac"
+        flac.write_bytes(b"fLaC" + b"\x00" * 100)
+        time.sleep(1.0)  # comfortably longer than _STABLE_SECS + _POLL_INTERVAL
+        assert received == []
+    finally:
+        m.stop()
+
+
+def test_non_excluded_files_still_work_alongside_exclusion(tmp_path):
+    """The exclusion is scoped to its own subfolder — everything else in the
+    monitored tree still converts normally."""
+    received = []
+    (tmp_path / ".hoarder-incoming").mkdir()
+    m = FolderMonitor(
+        str(tmp_path), lambda paths: received.append(paths), lambda paths: None,
+        exclude_dirname=".hoarder-incoming",
+    )
+    m.start()
+    try:
+        flac = tmp_path / "track.flac"
+        flac.write_bytes(b"fLaC" + b"\x00" * 100)
+        assert wait_for(lambda: len(received) == 1), "callback not fired"
+        assert received[0] == [str(flac)]
+    finally:
+        m.stop()
