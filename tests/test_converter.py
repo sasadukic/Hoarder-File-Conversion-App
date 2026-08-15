@@ -10,6 +10,13 @@ from cue_parser import Track
 
 
 # --- check_ffmpeg ---
+#
+# Every "not found" case below must also stub out the auto-download cache
+# dir to a path that doesn't exist — otherwise these tests are only
+# deterministic until someone actually runs the app on this machine and
+# populates the real %LOCALAPPDATA%\Hoarder\bin cache, at which point
+# check_ffmpeg() would start finding it and silently stop exercising the
+# PATH-fallback branch these tests exist to cover.
 
 def test_check_ffmpeg_bundled_exists():
     # Simulate bundled bin/ffmpeg.exe present — should return True without touching PATH
@@ -18,17 +25,29 @@ def test_check_ffmpeg_bundled_exists():
 
 
 def test_check_ffmpeg_system_path_found():
-    # No bundled exe, but found on system PATH
+    # No bundled exe, no cached download, but found on system PATH
     with patch("converter._LOCAL_FFMPEG", new=Path("/nonexistent/ffmpeg.exe")):
-        with patch("converter.shutil.which", return_value="/usr/bin/ffmpeg"):
-            assert check_ffmpeg() is True
+        with patch("converter._ffmpeg_cache_dir", return_value=Path("/nonexistent/cache")):
+            with patch("converter.shutil.which", return_value="/usr/bin/ffmpeg"):
+                assert check_ffmpeg() is True
 
 
 def test_check_ffmpeg_not_found():
-    # No bundled exe and not on PATH
+    # No bundled exe, no cached download, not on PATH
     with patch("converter._LOCAL_FFMPEG", new=Path("/nonexistent/ffmpeg.exe")):
-        with patch("converter.shutil.which", return_value=None):
-            assert check_ffmpeg() is False
+        with patch("converter._ffmpeg_cache_dir", return_value=Path("/nonexistent/cache")):
+            with patch("converter.shutil.which", return_value=None):
+                assert check_ffmpeg() is False
+
+
+def test_check_ffmpeg_cached_download_found(tmp_path):
+    # No bundled exe, not on PATH, but a previously auto-downloaded copy
+    # sits in the cache dir — should be found without touching PATH.
+    (tmp_path / "ffmpeg.exe").write_bytes(b"fake")
+    with patch("converter._LOCAL_FFMPEG", new=Path("/nonexistent/ffmpeg.exe")):
+        with patch("converter._ffmpeg_cache_dir", return_value=tmp_path):
+            with patch("converter.shutil.which", return_value=None):
+                assert check_ffmpeg() is True
 
 
 # --- split_and_convert ---
@@ -608,6 +627,39 @@ def test_copy_to_finished_multiple_files(tmp_path):
     assert result is None
     assert (finished / "a.mp3").exists()
     assert (finished / "b.mp3").exists()
+
+
+# --- move_to_folder ---
+
+def test_move_to_folder_creates_folder_and_moves(tmp_path):
+    from converter import move_to_folder
+    src = tmp_path / "output.mp3"
+    src.write_text("music")
+    dest = tmp_path / "music"
+    new_paths, warning = move_to_folder([str(src)], str(dest))
+    assert warning is None
+    assert new_paths == [str(dest / "output.mp3")]
+    assert (dest / "output.mp3").read_text() == "music"
+    assert not src.exists()  # moved, not copied — source is gone
+
+def test_move_to_folder_missing_file_skips_silently(tmp_path):
+    from converter import move_to_folder
+    dest = tmp_path / "music"
+    new_paths, warning = move_to_folder([str(tmp_path / "missing.mp3")], str(dest))
+    assert warning is None
+    assert new_paths == []
+
+def test_move_to_folder_multiple_files(tmp_path):
+    from converter import move_to_folder
+    f1 = tmp_path / "a.mp3"
+    f2 = tmp_path / "b.mp3"
+    f1.write_text("a")
+    f2.write_text("b")
+    dest = tmp_path / "music"
+    new_paths, warning = move_to_folder([str(f1), str(f2)], str(dest))
+    assert warning is None
+    assert set(new_paths) == {str(dest / "a.mp3"), str(dest / "b.mp3")}
+    assert not f1.exists() and not f2.exists()
 
 
 # --- video_output_path ---

@@ -4,12 +4,14 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from cue_parser import Track
+from ffmpeg_fetch import cache_dir as _ffmpeg_cache_dir
 
-# Bundled ffmpeg lives in bin/ffmpeg.exe next to this file.
-# Falls back to system PATH if the bundled copy is missing.
+# A local bin/ffmpeg.exe next to this file is a dev-mode convenience only —
+# shipped builds no longer bundle it. Falls back to the auto-downloaded
+# cache (see ffmpeg_fetch.py), then to system PATH.
 _LOCAL_FFMPEG = Path(__file__).parent / "bin" / "ffmpeg.exe"
 
 # Suppress console window on Windows when spawning subprocesses.
@@ -23,9 +25,12 @@ AUDIO_EXTS: frozenset[str] = frozenset({
 
 
 def _ffmpeg_exe() -> str:
-    """Return path to ffmpeg: bundled bin/ffmpeg.exe if present, else 'ffmpeg' (PATH)."""
+    """Path to ffmpeg: dev-local bin/, else the auto-download cache, else PATH."""
     if _LOCAL_FFMPEG.exists():
         return str(_LOCAL_FFMPEG)
+    cached = _ffmpeg_cache_dir() / "ffmpeg.exe"
+    if cached.exists():
+        return str(cached)
     return "ffmpeg"
 
 
@@ -33,9 +38,12 @@ _LOCAL_FFPROBE = Path(__file__).parent / "bin" / "ffprobe.exe"
 
 
 def _ffprobe_exe() -> str:
-    """Return path to ffprobe: bundled bin/ffprobe.exe if present, else 'ffprobe' (PATH)."""
+    """Path to ffprobe: dev-local bin/, else the auto-download cache, else PATH."""
     if _LOCAL_FFPROBE.exists():
         return str(_LOCAL_FFPROBE)
+    cached = _ffmpeg_cache_dir() / "ffprobe.exe"
+    if cached.exists():
+        return str(cached)
     return "ffprobe"
 
 
@@ -263,8 +271,10 @@ def _run_ffmpeg_progress(
 
 
 def check_ffmpeg() -> bool:
-    """Return True if ffmpeg is available (bundled bin/ or system PATH)."""
+    """Return True if ffmpeg is available (dev-local bin/, download cache, or PATH)."""
     if _LOCAL_FFMPEG.exists():
+        return True
+    if (_ffmpeg_cache_dir() / "ffmpeg.exe").exists():
         return True
     return shutil.which("ffmpeg") is not None
 
@@ -354,6 +364,38 @@ def copy_to_finished(converted_paths: List[str], finished_folder: str) -> Option
     if failures:
         return "Warning: could not copy to finished folder: " + "; ".join(failures)
     return None
+
+
+def move_to_folder(paths: List[str], dest_folder: str) -> Tuple[List[str], Optional[str]]:
+    """Move each existing path in *paths* into dest_folder.
+
+    Unlike copy_to_finished, the source is relocated rather than duplicated —
+    used for "Move music/video to", which is meant to declutter the monitored
+    folder rather than mirror it.
+
+    Returns (new_paths, warning). new_paths holds only the files actually
+    moved (missing sources are skipped, same as copy_to_finished); on a
+    partial failure it holds just the ones that succeeded.
+    """
+    dest = Path(dest_folder)
+    dest.mkdir(parents=True, exist_ok=True)
+    new_paths = []
+    failures = []
+    for path in paths:
+        src = Path(path)
+        if not src.exists():
+            continue
+        target = dest / src.name
+        try:
+            shutil.move(str(src), str(target))
+            new_paths.append(str(target))
+        except OSError as e:
+            failures.append(f"{src.name}: {e}")
+    warning = (
+        "Warning: could not move to destination: " + "; ".join(failures)
+        if failures else None
+    )
+    return new_paths, warning
 
 
 def delete_companion_files(
