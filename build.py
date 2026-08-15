@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
-"""Build Hoarder as a self-contained portable directory.
+"""Build Hoarder as a single portable executable.
 
 Usage:
     py build.py
 
 Output:
-    dist/Hoarder/          <- copy this folder anywhere, it runs standalone
-    dist/Hoarder/Hoarder.exe
+    dist/Hoarder.exe       <- copy this one file anywhere, it runs standalone
 
 Notes:
-    - ffmpeg.exe and ffprobe.exe (~96 MB each) are bundled inside the folder.
-    - settings.json is written next to Hoarder.exe so settings persist and
-      travel with the folder.
+    - ffmpeg.exe and ffprobe.exe are NOT bundled (they're ~96 MB each) — the
+      app downloads a static build on first use and caches it in
+      %LOCALAPPDATA%\Hoarder\bin (see ffmpeg_fetch.py). aria2c.exe is small
+      enough to keep bundling directly.
+    - settings.json/library.json are written next to Hoarder.exe (via
+      sys.executable, not the onefile temp-extraction dir) so they persist
+      and travel with the exe wherever it's copied.
+    - --onefile means every launch self-extracts to a temp dir first, so
+      startup is slower than the old --onedir build. Traded deliberately
+      for true single-file portability — see build.py's git history if that
+      tradeoff ever needs revisiting.
     - PyInstaller is installed automatically if not already present.
 """
 
@@ -28,50 +35,49 @@ def run(cmd: list) -> None:
     subprocess.run(cmd, check=True)
 
 
-def _pre_build_clean(dist_dir: Path) -> None:
+def _pre_build_clean(dist_exe: Path) -> None:
     """Prepare a clean output location before PyInstaller runs.
 
     Strategy:
-    1. Kill any running Hoarder.exe and ffmpeg.exe (they lock files in dist/).
-    2. Try to delete dist/Hoarder outright (works if nothing is locked).
-    3. If that fails, RENAME dist/Hoarder → dist/Hoarder_old — Windows allows
-       renaming a directory that contains locked files, which unblocks the
-       build path so PyInstaller can create a fresh dist/Hoarder.
-    4. Schedule a best-effort background deletion of dist/Hoarder_old.
+    1. Kill any running Hoarder.exe (it locks dist/Hoarder.exe while running).
+    2. Try to delete dist/Hoarder.exe outright (works if nothing is locked).
+    3. If that fails, RENAME it aside — Windows allows renaming a locked
+       file, which unblocks the build path so PyInstaller can create a
+       fresh one.
+    4. Best-effort delete the renamed-aside old exe after the build.
     """
-    for proc in ("Hoarder.exe", "ffmpeg.exe", "ffprobe.exe"):
-        result = subprocess.run(
-            ["taskkill", "/F", "/IM", proc],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            print(f"Terminated {proc}.")
+    result = subprocess.run(
+        ["taskkill", "/F", "/IM", "Hoarder.exe"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        print("Terminated Hoarder.exe.")
 
-    if not dist_dir.exists():
+    if not dist_exe.exists():
         return
 
     # Fast path: outright delete
     try:
-        shutil.rmtree(dist_dir)
-        print(f"Removed {dist_dir}.")
+        dist_exe.unlink()
+        print(f"Removed {dist_exe}.")
         return
     except PermissionError:
         pass
 
-    # Rename out of the way so PyInstaller can create a fresh directory
-    old_dir = dist_dir.parent / (dist_dir.name + "_old")
-    shutil.rmtree(old_dir, ignore_errors=True)
+    # Rename out of the way so PyInstaller can create a fresh file
+    old_exe = dist_exe.with_name(dist_exe.stem + "_old" + dist_exe.suffix)
+    old_exe.unlink(missing_ok=True)
     try:
-        dist_dir.rename(old_dir)
-        print(f"Renamed {dist_dir.name} → {old_dir.name} (files are locked; will delete after build).")
+        dist_exe.rename(old_exe)
+        print(f"Renamed {dist_exe.name} → {old_exe.name} (file is locked; will delete after build).")
     except Exception as e:
-        print(f"Warning: could not rename old dist dir: {e} — build may fail if AV holds ffmpeg.exe.")
+        print(f"Warning: could not rename old exe: {e} — build may fail if AV holds it.")
 
 
 
 def main() -> None:
     # ------------------------------------------------------------------ deps
-    _pre_build_clean(HERE / "dist" / "Hoarder")
+    _pre_build_clean(HERE / "dist" / "Hoarder.exe")
     try:
         import PyInstaller  # noqa: F401
     except ImportError:
@@ -90,17 +96,22 @@ def main() -> None:
     datas = [
         f"{HERE / 'slkscr.ttf'}{S}.",
         f"{HERE / 'hoarder.ico'}{S}.",
-        f"{HERE / 'bin'}{S}bin",
         f"{tnd_dir}{S}tkinterdnd2",
         f"{ctk_dir}{S}customtkinter",
     ]
     for wav in sorted(HERE.glob("*.wav")):
         datas.append(f"{wav}{S}.")
 
+    # aria2c.exe only — ffmpeg.exe/ffprobe.exe are fetched on demand instead
+    # of bundled (see module docstring).
+    binaries = [
+        f"{HERE / 'bin' / 'aria2c.exe'}{S}bin",
+    ]
+
     # ----------------------------------------------------------------- build
     cmd = [
         sys.executable, "-m", "PyInstaller",
-        "--onedir",                        # portable folder, fast startup
+        "--onefile",                       # single portable exe
         "--windowed",                      # no console window
         "--name", "Hoarder",
         "--icon", str(HERE / "hoarder.ico"),
@@ -109,6 +120,8 @@ def main() -> None:
     ]
     for d in datas:
         cmd += ["--add-data", d]
+    for b in binaries:
+        cmd += ["--add-binary", b]
 
     cmd += [
         # runtime hooks / hidden imports that PyInstaller misses
@@ -118,31 +131,31 @@ def main() -> None:
         str(HERE / "main.py"),
     ]
 
-    # Pre-clean old dist so PyInstaller never trips on AV-locked ffmpeg/ffprobe
+    # Pre-clean old dist so PyInstaller never trips on an AV-locked exe
     # (already handled by _pre_build_clean above, but kept for explicitness)
     run(cmd)
 
-    # Best-effort cleanup of the renamed-aside old dist (from _pre_build_clean)
-    old_dir = HERE / "dist" / "Hoarder_old"
-    if old_dir.exists():
-        shutil.rmtree(old_dir, ignore_errors=True)
-        if not old_dir.exists():
-            print("Removed dist/Hoarder_old.")
+    # Best-effort cleanup of the renamed-aside old exe (from _pre_build_clean)
+    old_exe = HERE / "dist" / "Hoarder_old.exe"
+    if old_exe.exists():
+        try:
+            old_exe.unlink()
+            print("Removed dist/Hoarder_old.exe.")
+        except OSError:
+            pass
 
-    # Remove the intermediate build/ artefacts so the incomplete exe inside
-    # build/Hoarder/ can't be run by mistake (it fails with a DLL error).
+    # Remove the intermediate build/ artefacts.
     build_dir = HERE / "build"
     if build_dir.exists():
         shutil.rmtree(build_dir)
         print("Removed intermediate build/ directory.")
 
-    out = HERE / "dist" / "Hoarder"
+    out = HERE / "dist" / "Hoarder.exe"
     print()
     print("Build complete.")
-    print(f"  Portable folder : {out}")
-    print(f"  Launcher        : {out / 'Hoarder.exe'}")
+    print(f"  Portable exe : {out}")
     print()
-    print("Copy the entire 'dist/Hoarder/' folder to distribute.")
+    print("Copy this one file to distribute.")
 
 
 if __name__ == "__main__":
