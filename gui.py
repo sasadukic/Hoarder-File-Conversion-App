@@ -14,10 +14,10 @@ from tkinter import filedialog
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import shutil
-from torrent_downloader import TorrentDownloader
+from torrent_downloader import TorrentDownloader, STAGING_DIRNAME
 
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 import customtkinter as ctk
 from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -29,6 +29,7 @@ from converter import (
 )
 import settings as smod
 import monitor as mmod
+import library as libmod
 
 MODE_SPLIT  = "Split + Convert"
 MODE_CONVERT = "Convert Only"
@@ -69,24 +70,116 @@ GREEN = LIGHT   # success, convert button, done
 GOLD  = LIGHT   # in-progress
 WARM  = LIGHT   # warnings / errors
 
+# Overall UI scale — everything pixel-sized in this file is defined in terms
+# of this, so the whole app can be resized as one proportional unit.
+SCALE = 1
 
-def collect_media(root: str) -> List[str]:
-    """Audio and video files under *root*.
+# Progress bars: white fill on the dark track, hard corners, 1 px white outline
+BAR_W = 190 * SCALE
+BAR_H = 18 * SCALE
+BAR_FONT_PX = 16 * SCALE   # Silkscreen renders crisp at its design sizes (8, 16, …)
 
-    *root* may be a directory (searched recursively) or a single file — a
-    completed torrent is either, depending on whether it held one file or
-    many.
+# ---------------------------------------------------------------------------
+# Layout — every white box keeps the same margin from the tab outline
+# ---------------------------------------------------------------------------
+PAD      = 8 * SCALE     # gap between the tab outline and a box, and between boxes
+INNER    = 10 * SCALE    # gap between a box outline and its contents
+TAB_W    = 468 * SCALE   # tabview width
+DROP_H   = 72 * SCALE
+LIST_H   = 148 * SCALE   # downloads box and encoding box
+
+# customtkinter's tabview spends a fixed 36px on its tab strip regardless of
+# widget scaling (that's baked into CTkTabview's own class constants, not
+# something a border_width/font choice can resize) — only the border-driven
+# padding around the page content actually scales with BORDER below.
+BORDER = 2 * SCALE
+_TAB_CHROME_H = 36 + 2 * BORDER
+_TAB_CHROME_W = 2 * BORDER
+SCROLL_INSET = 8 * SCALE   # gap between a scroll box's outline and its CTkScrollableFrame
+
+PAGE_W   = TAB_W - _TAB_CHROME_W
+PAGE_H   = PAD + DROP_H + PAD + LIST_H + PAD + LIST_H + PAD
+BOX_W    = PAGE_W - 2 * PAD
+TAB_H    = PAGE_H + _TAB_CHROME_H
+WINDOW_W = TAB_W + 2 * PAD * 2
+WINDOW_H = TAB_H + 2 * PAD
+
+
+class PixelBar(tk.Label):
+    """Progress bar with the percentage printed inside it.
+
+    Rendered as an image rather than assembled from widgets: that is the only
+    way to invert the digits *exactly* where the fill passes under them —
+    dark text on the filled part, light text on the rest — instead of flipping
+    a whole character at a time.
     """
-    p = Path(root)
-    exts = set(AUDIO_EXTS) | VIDEO_EXTS
-    if p.is_file():
-        return [str(p)] if p.suffix.lower() in exts else []
-    if not p.is_dir():
-        return []
-    return [
-        str(f) for f in sorted(p.rglob("*"))
-        if f.is_file() and f.suffix.lower() in exts
-    ]
+
+    _fonts: Dict[int, "ImageFont.FreeTypeFont"] = {}
+
+    def __init__(self, master, width: int = BAR_W, height: int = BAR_H):
+        super().__init__(master, bd=0, highlightthickness=0, bg=BG)
+        # Not _w/_h: tkinter.Misc uses _w for the widget's Tcl path name.
+        self._bar_w = width
+        self._bar_h = height
+        self._value = 0.0
+        self._text = "0%"
+        self._photo: Optional[ImageTk.PhotoImage] = None
+        self._render()
+
+    # -- geometry ------------------------------------------------------
+    @staticmethod
+    def _fill_px(value: float, width: int) -> int:
+        """Filled width in pixels, inside the 1 px border on each side."""
+        value = min(max(value, 0.0), 1.0)
+        return int(round((width - 2) * value))
+
+    @classmethod
+    def _font(cls, size: int) -> "ImageFont.FreeTypeFont":
+        font = cls._fonts.get(size)
+        if font is None:
+            ttf = Path(__file__).parent / "slkscr.ttf"
+            try:
+                font = ImageFont.truetype(str(ttf), size)
+            except OSError:
+                font = ImageFont.load_default()
+            cls._fonts[size] = font
+        return font
+
+    # -- public --------------------------------------------------------
+    def set(self, value: float, text: Optional[str] = None) -> None:
+        value = min(max(value, 0.0), 1.0)
+        text = f"{int(value * 100)}%" if text is None else text
+        if value == self._value and text == self._text:
+            return
+        self._value = value
+        self._text = text
+        self._render()
+
+    # -- drawing -------------------------------------------------------
+    def _render(self) -> None:
+        w, h = self._bar_w, self._bar_h
+        base = Image.new("RGB", (w, h), DARK)
+        draw = ImageDraw.Draw(base)
+        draw.rectangle((0, 0, w - 1, h - 1), outline=LIGHT)
+        fill = self._fill_px(self._value, w)
+        if fill:
+            draw.rectangle((1, 1, fill, h - 2), fill=LIGHT)
+
+        # 1-bit layer keeps the pixel font free of anti-aliasing
+        mask = Image.new("1", (w, h), 0)
+        ImageDraw.Draw(mask).text(
+            (w / 2, h / 2), self._text, fill=1,
+            font=self._font(BAR_FONT_PX), anchor="mm",
+        )
+        img = base.copy()
+        img.paste(LIGHT, (0, 0, w, h), mask)
+        if fill:
+            over = base.copy()
+            over.paste(DARK, (0, 0, w, h), mask)
+            img.paste(over.crop((1, 1, fill + 1, h - 1)), (1, 1))
+
+        self._photo = ImageTk.PhotoImage(img)
+        self.configure(image=self._photo)
 
 
 def format_torrent_name(name: str, limit: int = 20) -> str:
@@ -198,7 +291,7 @@ class App(TkinterDnD.Tk):
         ctk.set_window_scaling(1.0)
 
         self.title("Hoarder")
-        self.geometry("500x620")
+        self.geometry(f"{WINDOW_W}x{WINDOW_H}")
         self.resizable(False, False)
         self.configure(bg=BG)
 
@@ -236,21 +329,26 @@ class App(TkinterDnD.Tk):
 
         # Wave animation state (drop zone only)
         self._wave_phase: float = 0.0
-        self._wave_font_drop = tkfont.Font(family="Silkscreen", size=16)
-        self._wave_font_btn = tkfont.Font(family="Silkscreen", size=28)
-        self._btn_fonts = [
-            tkfont.Font(family="Silkscreen", size=s) for s in (28, 24, 20, 16, 12)
+        self._wave_font_drop = tkfont.Font(family="Silkscreen", size=16 * SCALE)
+        # Smaller steps so a long status message shrinks instead of eliding.
+        self._wave_fonts = [self._wave_font_drop] + [
+            tkfont.Font(family="Silkscreen", size=n * SCALE) for n in (12, 10, 8)
         ]
-        self._btn_max_w = 428
+        # The drop zone doubles as the status line: messages replace the
+        # "Drag & Drop" text for a few seconds, then it reverts.
+        self._drop_text: str = "Drag & Drop"
+        self._drop_color: str = DIM
+        self._drop_font = self._wave_font_drop
+        self._drop_revert_id: Optional[str] = None
 
         # ------------------------------------------------------------------
         # Tab view
         # ------------------------------------------------------------------
         self._tabview = ctk.CTkTabview(
-            self, width=468, height=478,
+            self, width=TAB_W, height=TAB_H,
             fg_color=BG,
             corner_radius=0,
-            border_width=2,
+            border_width=BORDER,
             segmented_button_fg_color=DARK,
             segmented_button_selected_color=LIGHT,
             segmented_button_unselected_color=DARK,
@@ -258,26 +356,30 @@ class App(TkinterDnD.Tk):
             segmented_button_unselected_hover_color=DARK,
             text_color=LIGHT,
         )
-        self._tabview.place(x=16, y=8)
+        self._tabview.place(x=2 * PAD, y=PAD)
         self._tabview.configure(command=self._on_tab_changed)
+        # Deliberately NOT scaled with the rest of the UI: the segmented
+        # button's own height is one of CTkTabview's fixed internal
+        # constants (~26px, unaffected by border_width or widget_scaling
+        # while widget_scaling stays at 1.0), so a doubled font would just
+        # get clipped inside an unchanged-height button.
         self._tabview._segmented_button.configure(
             font=("Silkscreen", 16),
         )
 
         main_tab = self._tabview.add("Main")
-        self._tabview.add("Downloads")
-        self._tabview.add("Encoding")
         self._tabview.add("Setup")
+        self._tabview.add("Quit")
         self._update_tab_colors()
 
         # ------------------------------------------------------------------
-        # Main tab — drop zone + file info + convert button
+        # Main tab — drop zone, downloads box, encoding box
         # ------------------------------------------------------------------
         self._drop_frame = tk.Frame(
             main_tab, bg=PANEL,
-            highlightbackground=TEAL, highlightthickness=2, cursor="hand2",
+            highlightbackground=TEAL, highlightthickness=BORDER, cursor="hand2",
         )
-        self._drop_frame.place(x=0, y=12, width=452, height=76)
+        self._drop_frame.place(x=PAD, y=PAD, width=BOX_W, height=DROP_H)
 
         self._drop_canvas = tk.Canvas(
             self._drop_frame, bg=PANEL, highlightthickness=0, cursor="hand2",
@@ -289,192 +391,332 @@ class App(TkinterDnD.Tk):
             widget.dnd_bind("<<Drop>>", self._on_drop)
             widget.bind("<Button-1>", lambda e: self._browse())
 
-        self._scroll_text: str = ""
-        self._scroll_color: str = DIM
-        self._scroll_x: float = 0.0
-        self._scroll_active: bool = False
-
-        self._info_canvas = tk.Canvas(main_tab, bg=BG, highlightthickness=0)
-        self._info_canvas.place(x=0, y=98, width=452, height=36)
-        self._set_info("No files loaded", DIM)
-
-        self._convert_btn = ctk.CTkButton(
-            main_tab, text="Convert", font=("Silkscreen", 28), state="disabled",
-            command=self._start_conversion, width=452, height=56,
-            fg_color=LIGHT, hover_color=LIGHT,
-            text_color=DARK, text_color_disabled=DARK, corner_radius=0,
-        )
-        self._convert_btn.place(x=0, y=148)
-        self._set_btn_text("Convert")
-
-        # ------------------------------------------------------------------
-        # Downloads tab — torrent progress list
-        # ------------------------------------------------------------------
         # Both progress lists scroll: a large monitored folder registers one
-        # row per file, which would otherwise render off the bottom of the tab.
-        _scroll = dict(
-            fg_color=BG, corner_radius=0,
-            scrollbar_fg_color=BG,
-            scrollbar_button_color=LIGHT,
-            scrollbar_button_hover_color=LIGHT,
+        # row per file, which would otherwise render off the bottom of the box.
+        dl_y = PAD + DROP_H + PAD
+        self._torrent_progress_frame = self._make_scroll_box(
+            main_tab, PAD, dl_y, BOX_W, LIST_H,
         )
-
-        dl_tab = self._tabview.tab("Downloads")
-        self._torrent_progress_frame = ctk.CTkScrollableFrame(
-            dl_tab, width=416, height=416, **_scroll,
-        )
-        self._torrent_progress_frame.place(x=0, y=0)
         self._torrent_progress_widgets: Dict[str, dict] = {}
 
-        # ------------------------------------------------------------------
-        # Encoding tab — conversion progress list
-        # ------------------------------------------------------------------
-        enc_tab = self._tabview.tab("Encoding")
-        self._encoding_progress_frame = ctk.CTkScrollableFrame(
-            enc_tab, width=416, height=416, **_scroll,
+        self._encoding_progress_frame = self._make_scroll_box(
+            main_tab, PAD, dl_y + LIST_H + PAD, BOX_W, LIST_H,
         )
-        self._encoding_progress_frame.place(x=0, y=0)
         self._encoding_progress_widgets: Dict[str, dict] = {}
 
         # ------------------------------------------------------------------
         # Setup tab — all settings
         # ------------------------------------------------------------------
         _ck = dict(
-            font=("Silkscreen", 16), text_color=LIGHT, fg_color=LIGHT,
+            font=("Silkscreen", 16 * SCALE), text_color=LIGHT, fg_color=LIGHT,
             border_color=LIGHT, hover_color=LIGHT, checkmark_color=DARK,
-            checkbox_width=20, checkbox_height=20, corner_radius=0,
+            checkbox_width=20 * SCALE, checkbox_height=20 * SCALE, corner_radius=0,
         )
 
+        # A white box like the ones on the main page, filling the same visible
+        # area — but scrollable (hidden scrollbar, same trick as the Main
+        # tab's progress boxes), since the proxy section below pushes the
+        # content taller than the box.
         setup_tab = self._tabview.tab("Setup")
+        setup_box = self._make_scroll_box(setup_tab, PAD, PAD, BOX_W, PAGE_H - 2 * PAD)
 
-        self._delete_var = tk.BooleanVar(value=s["delete_flac"])
-        self._delete_check = ctk.CTkCheckBox(
-            setup_tab, text="Delete file after conversion",
-            variable=self._delete_var, command=self._play_click, **_ck,
-        )
-        self._delete_check.place(x=0, y=8)
+        row_w = BOX_W - SCROLL_INSET   # matches _make_scroll_box's own inner inset
 
-        self._auto_convert_var = tk.BooleanVar(value=s["auto_convert"])
-        self._auto_check = ctk.CTkCheckBox(
-            setup_tab, text="Auto-convert on load",
-            variable=self._auto_convert_var, command=self._play_click, **_ck,
-        )
-        self._auto_check.place(x=0, y=40)
+        # Four groups, each a plain 32px pitch, with a wider gap between
+        # groups: general app behavior, then folder-watching + what happens
+        # to converted output, then torrent-specific settings, then proxy.
+        ROW_PITCH = 32 * SCALE
+        GAP = 16 * SCALE
+        y = INNER
+        rows = {}
+        for name in ("tray", "startup", "sounds"):
+            rows[name] = y
+            y += ROW_PITCH
+        y += GAP
+        for name in ("monitor", "delete", "move_music", "move_video"):
+            rows[name] = y
+            y += ROW_PITCH
+        y += GAP
+        for name in ("torrent", "torrent_delete", "magnet"):
+            rows[name] = y
+            y += ROW_PITCH
+        y += GAP
+        for name in ("proxy_enabled", "proxy_host", "proxy_port", "proxy_user", "proxy_pass"):
+            rows[name] = y
+            y += ROW_PITCH
+        content_h = y + INNER
+
+        # No Convert button any more — loaded files always convert, so the
+        # old "Auto-convert on load" toggle has no off state to offer.
+        self._auto_convert_var = tk.BooleanVar(value=True)
 
         self._tray_var = tk.BooleanVar(value=s["minimize_to_tray"])
         self._tray_check = ctk.CTkCheckBox(
-            setup_tab, text="Minimize to tray",
+            setup_box, text="Minimize to tray",
             variable=self._tray_var, command=self._on_tray_toggle, **_ck,
         )
-        self._tray_check.place(x=0, y=72)
+        self._tray_check.place(x=INNER, y=rows["tray"])
 
         self._startup_var = tk.BooleanVar(value=s["start_on_startup"])
         self._startup_check = ctk.CTkCheckBox(
-            setup_tab, text="Start on Windows startup",
+            setup_box, text="Start on Windows startup",
             variable=self._startup_var, command=self._on_startup_toggle, **_ck,
         )
-        self._startup_check.place(x=0, y=104)
+        self._startup_check.place(x=INNER, y=rows["startup"])
 
-        # --- Monitor folder row ---
-        self._monitor_var = tk.BooleanVar(value=False)
-        self._monitor_check = ctk.CTkCheckBox(
-            setup_tab, text="Monitor folder",
-            variable=self._monitor_var, command=self._on_monitor_toggle, **_ck,
+        self._sounds_var = tk.BooleanVar(value=s.get("sounds_enabled", True))
+        self._sounds_check = ctk.CTkCheckBox(
+            setup_box, text="Sounds",
+            variable=self._sounds_var, command=self._play_click, **_ck,
         )
-        self._monitor_check.place(x=0, y=136)
+        self._sounds_check.place(x=INNER, y=rows["sounds"])
 
-        self._monitor_browse_btn = ctk.CTkButton(
-            setup_tab, text="Browse…", font=("Silkscreen", 16),
-            width=94, height=28, fg_color=DARK, hover_color=DARK,
-            text_color=LIGHT, border_color=LIGHT, border_width=2,
-            corner_radius=0, command=self._browse_monitor_folder,
-        )
-        self._monitor_browse_btn.place(x=350, y=136)
-
+        # --- Monitor folder + what happens to converted output ---
         saved_folder = s["monitor_folder"] or ""
         if saved_folder and not Path(saved_folder).is_dir():
             saved_folder = ""
         self._monitor_folder_var = tk.StringVar(value=saved_folder)
-        self._monitor_folder_label = tk.Label(
-            setup_tab, text="", bg=BG, fg=DIM,
-            font=("Silkscreen", 8), anchor="w", wraplength=0,
+        self._monitor_var = tk.BooleanVar(value=False)
+        self._make_folder_row(
+            setup_box, rows["monitor"], "Monitor folder",
+            self._monitor_var, self._monitor_folder_var,
+            self._on_monitor_toggle, self._browse_monitor_folder, row_w,
         )
-        self._monitor_folder_label.place(x=0, y=168, width=452, height=30)
-        self._monitor_folder_var.trace_add("write", lambda *_: self._update_folder_display())
-        self._update_folder_display()
+
+        self._delete_var = tk.BooleanVar(value=s["delete_flac"])
+        self._delete_check = ctk.CTkCheckBox(
+            setup_box, text="Delete file after conversion",
+            variable=self._delete_var, command=self._play_click, **_ck,
+        )
+        self._delete_check.place(x=INNER, y=rows["delete"])
+
+        self._move_music_folder_var = tk.StringVar(value=s.get("move_music_folder") or "")
+        self._move_music_var = tk.BooleanVar(value=s.get("move_music_enabled", False))
+        self._make_folder_row(
+            setup_box, rows["move_music"], "Move music to",
+            self._move_music_var, self._move_music_folder_var,
+            self._on_move_music_toggle, self._browse_move_music_folder, row_w,
+        )
+
+        self._move_video_folder_var = tk.StringVar(value=s.get("move_video_folder") or "")
+        self._move_video_var = tk.BooleanVar(value=s.get("move_video_enabled", False))
+        self._make_folder_row(
+            setup_box, rows["move_video"], "Move video to",
+            self._move_video_var, self._move_video_folder_var,
+            self._on_move_video_toggle, self._browse_move_video_folder, row_w,
+        )
 
         # --- Torrent settings ---
+        # No separate download/finished folders any more — torrents land
+        # straight in the monitored folder above and convert the same way
+        # anything else dropped in there would.
         self._torrent_var = tk.BooleanVar(value=s.get("torrent_enabled", False))
         self._torrent_check = ctk.CTkCheckBox(
-            setup_tab, text="Auto-download torrents",
+            setup_box, text="Auto-download torrents",
             variable=self._torrent_var, command=self._on_torrent_toggle, **_ck,
         )
-        self._torrent_check.place(x=0, y=204)
-
-        self._torrent_download_browse_btn = ctk.CTkButton(
-            setup_tab, text="Download…", font=("Silkscreen", 16),
-            width=94, height=28, fg_color=DARK, hover_color=DARK,
-            text_color=LIGHT, border_color=LIGHT, border_width=2,
-            corner_radius=0, command=self._browse_torrent_download_folder,
-        )
-        self._torrent_download_browse_btn.place(x=252, y=236)
-
-        self._torrent_finished_browse_btn = ctk.CTkButton(
-            setup_tab, text="Finished…", font=("Silkscreen", 16),
-            width=94, height=28, fg_color=DARK, hover_color=DARK,
-            text_color=LIGHT, border_color=LIGHT, border_width=2,
-            corner_radius=0, command=self._browse_torrent_finished_folder,
-        )
-        self._torrent_finished_browse_btn.place(x=352, y=236)
-
-        saved_dl = s.get("torrent_download_folder") or ""
-        saved_fin = s.get("torrent_finished_folder") or ""
-        self._torrent_download_var = tk.StringVar(value=saved_dl)
-        self._torrent_finished_var = tk.StringVar(value=saved_fin)
+        self._torrent_check.place(x=INNER, y=rows["torrent"])
 
         self._torrent_delete_var = tk.BooleanVar(value=s.get("torrent_delete_source", False))
         self._torrent_delete_check = ctk.CTkCheckBox(
-            setup_tab, text="Delete torrent file after adding",
+            setup_box, text="Delete torrent file after adding",
             variable=self._torrent_delete_var, command=self._play_click, **_ck,
         )
-        self._torrent_delete_check.place(x=0, y=272)
+        self._torrent_delete_check.place(x=INNER, y=rows["torrent_delete"])
 
         self._magnet_handler_var = tk.BooleanVar(value=self._is_magnet_handler_registered())
         self._magnet_handler_check = ctk.CTkCheckBox(
-            setup_tab, text="Open magnet links in Hoarder",
+            setup_box, text="Open magnet links in Hoarder",
             variable=self._magnet_handler_var, command=self._on_magnet_handler_toggle, **_ck,
         )
-        self._magnet_handler_check.place(x=0, y=304)
+        self._magnet_handler_check.place(x=INNER, y=rows["magnet"])
+
+        # --- SOCKS5 proxy ---
+        self._proxy_host_var = tk.StringVar(value=s.get("proxy_host") or "")
+        self._proxy_port_var = tk.StringVar(
+            value=str(s.get("proxy_port")) if s.get("proxy_port") else ""
+        )
+        self._proxy_username_var = tk.StringVar(value=s.get("proxy_username") or "")
+        self._proxy_password_var = tk.StringVar(value=s.get("proxy_password") or "")
+        self._proxy_var = tk.BooleanVar(value=s.get("proxy_enabled", False))
+
+        self._proxy_check = ctk.CTkCheckBox(
+            setup_box, text="Enable SOCKS5 proxy",
+            variable=self._proxy_var, command=self._on_proxy_toggle, **_ck,
+        )
+        self._proxy_check.place(x=INNER, y=rows["proxy_enabled"])
+        self._make_entry_row(
+            setup_box, rows["proxy_host"], "Host", self._proxy_host_var, row_w,
+        )
+        self._make_entry_row(
+            setup_box, rows["proxy_port"], "Port", self._proxy_port_var, row_w,
+        )
+        self._make_entry_row(
+            setup_box, rows["proxy_user"], "Username", self._proxy_username_var, row_w,
+        )
+        self._make_entry_row(
+            setup_box, rows["proxy_pass"], "Password", self._proxy_password_var, row_w,
+            show="*",
+        )
 
         # --- Settings traces ---
         for var in (
             self._delete_var, self._auto_convert_var,
-            self._tray_var, self._startup_var,
+            self._tray_var, self._startup_var, self._sounds_var,
             self._monitor_var, self._monitor_folder_var,
-            self._torrent_var, self._torrent_download_var,
-            self._torrent_finished_var, self._torrent_delete_var,
+            self._torrent_var, self._torrent_delete_var,
+            self._move_music_var, self._move_music_folder_var,
+            self._move_video_var, self._move_video_folder_var,
             self._magnet_handler_var,
+            self._proxy_var, self._proxy_host_var, self._proxy_port_var,
+            self._proxy_username_var, self._proxy_password_var,
         ):
             var.trace_add("write", lambda *_: self._save_settings())
 
+        # Bypasses CTkScrollableFrame's own configure() override, which
+        # resizes the visible viewport instead of the scrollable content —
+        # .place()'d children (everything above) don't propagate a size
+        # request to their parent the way pack()/grid() children would, so
+        # the content height has to be set explicitly for scrolling to work.
+        tk.Frame.configure(setup_box, height=content_h)
+
         self.bind("<Unmap>", self._on_unmap)
+        self.protocol("WM_DELETE_WINDOW", self._on_close_button)
 
         # Restore monitor state
         if s["monitor_folder"] and s["monitor_enabled"]:
             self._monitor_var.set(True)
             self._start_monitor(s["monitor_folder"])
 
-        # Restore torrent downloader state
-        if s.get("torrent_enabled") and s.get("torrent_download_folder"):
+        # Restore torrent downloader state — needs monitoring active, since
+        # torrents now download into the monitored folder itself.
+        if s.get("torrent_enabled") and self._monitor_var.get():
             self._start_torrent_downloader()
 
         # Start animation loop
         self.after(40, self._wave_tick)
 
     # ------------------------------------------------------------------
+    # Scrollable, outlined progress boxes
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _make_scroll_box(
+        parent, x: int, y: int, w: int, h: int
+    ) -> ctk.CTkScrollableFrame:
+        """An outlined box holding a scrollable list with no visible scrollbar.
+
+        The scrollbar is un-gridded rather than removed — customtkinter still
+        drives it, and the mouse wheel still scrolls the canvas underneath.
+        """
+        box = tk.Frame(
+            parent, bg=BG, highlightbackground=TEAL, highlightthickness=BORDER,
+        )
+        box.place(x=x, y=y, width=w, height=h)
+        inner = ctk.CTkScrollableFrame(
+            box, width=w - SCROLL_INSET, height=h - SCROLL_INSET,
+            fg_color=BG, corner_radius=0,
+            scrollbar_fg_color=BG,
+            scrollbar_button_color=BG,
+            scrollbar_button_hover_color=BG,
+        )
+        inner.pack(fill="both", expand=True)
+        inner._scrollbar.grid_forget()
+        return inner
+
+    def _make_folder_row(
+        self, parent, y: int, name: str,
+        is_var: tk.BooleanVar, path_var: tk.StringVar,
+        on_toggle, on_browse, row_w: int,
+    ) -> ctk.CTkCheckBox:
+        """Checkbox + a clickable "<name>  <path>" label, all on one line.
+
+        There is no separate Browse button — clicking the label opens the
+        folder picker. The path is elided to fit whatever room is left after
+        the name, same technique as the drop-zone status text.
+        """
+        check_size = 20 * SCALE
+        check = ctk.CTkCheckBox(
+            parent, text="", variable=is_var, command=on_toggle,
+            fg_color=LIGHT, border_color=LIGHT, hover_color=LIGHT,
+            checkmark_color=DARK, checkbox_width=check_size, checkbox_height=check_size,
+            corner_radius=0, width=check_size,
+        )
+        check.place(x=INNER, y=y)
+
+        # Negative size = pixel height, not points — matches what
+        # customtkinter's own font scaling produces for its "16" checkboxes,
+        # so this label reads at the same visual size as the others.
+        name_font = tkfont.Font(family="Silkscreen", size=-16 * SCALE)
+        path_font = tkfont.Font(family="Silkscreen", size=8 * SCALE)
+        name_x = INNER + check_size + 8 * SCALE
+
+        # Both labels are vertically centered on the checkbox's own center,
+        # not just eyeballed — that's what kept the path text sitting a few
+        # pixels below the name text.
+        row_center = y + check_size // 2
+        name_h, path_h = 24 * SCALE, 16 * SCALE
+
+        name_lbl = tk.Label(
+            parent, text=name, bg=BG, fg=LIGHT, font=name_font,
+            anchor="w", cursor="hand2",
+        )
+        name_lbl.place(x=name_x, y=row_center - name_h // 2, height=name_h)
+
+        path_x = name_x + name_font.measure(name) + 10 * SCALE
+        max_path_px = max(row_w - path_x - INNER, 0)
+        path_lbl = tk.Label(
+            parent, text="", bg=BG, fg=DIM, font=path_font,
+            anchor="w", cursor="hand2",
+        )
+        path_lbl.place(x=path_x, y=row_center - path_h // 2, width=max_path_px, height=path_h)
+
+        def browse(_event=None) -> None:
+            self._play_click()
+            on_browse()
+
+        name_lbl.bind("<Button-1>", browse)
+        path_lbl.bind("<Button-1>", browse)
+
+        def refresh(*_args) -> None:
+            text = path_var.get()
+            path_lbl.configure(
+                text=self._elide(text, path_font, max_path_px) if text else ""
+            )
+        path_var.trace_add("write", refresh)
+        refresh()
+
+        return check
+
+    def _make_entry_row(
+        self, parent, y: int, label: str, var: tk.StringVar, row_w: int,
+        show: Optional[str] = None,
+    ) -> ctk.CTkEntry:
+        """Label + editable text field on one line — the typed-value
+        analogue of _make_folder_row, for settings that need real input
+        (proxy host/port/credentials) instead of a folder picker."""
+        name_font = tkfont.Font(family="Silkscreen", size=-16 * SCALE)
+        name_lbl = tk.Label(
+            parent, text=label, bg=BG, fg=LIGHT, font=name_font, anchor="w",
+        )
+        name_lbl.place(x=INNER, y=y + 4 * SCALE, height=24 * SCALE)
+
+        entry_x = INNER + name_font.measure(label) + 10 * SCALE
+        entry_w = max(row_w - entry_x - INNER, 60 * SCALE)
+        entry = ctk.CTkEntry(
+            parent, textvariable=var, show=show,
+            font=("Silkscreen", 14 * SCALE), fg_color=BG, border_color=LIGHT,
+            text_color=LIGHT, corner_radius=0, width=entry_w, height=28 * SCALE,
+        )
+        entry.place(x=entry_x, y=y)
+        return entry
+
+    # ------------------------------------------------------------------
     # Tab bar colors — keep unselected tab labels visible
     # ------------------------------------------------------------------
     def _on_tab_changed(self) -> None:
+        if self._tabview.get() == "Quit":
+            self.after(0, self.destroy)
+            return
         self._update_tab_colors()
 
     def _update_tab_colors(self) -> None:
@@ -506,19 +748,6 @@ class App(TkinterDnD.Tk):
             else:
                 hi = mid - 1
         return text[:lo] + "\u2026"
-
-    def _set_btn_text(self, text: str) -> None:
-        """Set convert button text, shrinking font until it fits."""
-        for font in self._btn_fonts:
-            if font.measure(text) <= self._btn_max_w:
-                size = font.cget("size")
-                self._convert_btn.configure(text=text, font=("Silkscreen", size))
-                return
-        small = self._btn_fonts[-1]
-        truncated = self._elide(text, small, self._btn_max_w)
-        self._convert_btn.configure(
-            text=truncated, font=("Silkscreen", small.cget("size"))
-        )
 
     # ------------------------------------------------------------------
     # Sound
@@ -556,6 +785,9 @@ class App(TkinterDnD.Tk):
                     pass
 
     def _play(self, filename: str) -> None:
+        sounds_var = getattr(self, "_sounds_var", None)
+        if sounds_var is not None and not sounds_var.get():
+            return
         path = self._sound_paths.get(filename)
         if not path:
             return
@@ -577,11 +809,6 @@ class App(TkinterDnD.Tk):
     # ------------------------------------------------------------------
     # Drop / browse
     # ------------------------------------------------------------------
-    def _update_folder_display(self) -> None:
-        folder = self._monitor_folder_var.get()
-        name = Path(folder).name if folder else "No folder monitored"
-        self._monitor_folder_label.config(text=name)
-
     def _on_drop(self, event) -> None:
         paths = expand_drops(parse_drop_paths(event.data))
         self._handle_paths(paths)
@@ -645,11 +872,11 @@ class App(TkinterDnD.Tk):
     def _add_dropped_torrents(self, torrents: List[str]) -> None:
         """Send dropped .torrent/.magnet files to the torrent downloader."""
         if self._torrent_downloader is None:
-            if self._torrent_download_var.get():
+            if self._monitor_folder_var.get() and self._monitor_var.get():
                 self._torrent_var.set(True)
                 self._start_torrent_downloader()
             else:
-                self._set_info("Set a torrent Download folder in Setup first", WARM)
+                self._set_info("Enable Monitor folder in Setup first", WARM)
                 return
         if self._torrent_downloader is None:
             return
@@ -667,7 +894,6 @@ class App(TkinterDnD.Tk):
         mode, flacs, cue, videos, error = detect_mode(paths)
         if error:
             self._set_info(error, WARM)
-            self._convert_btn.configure(state="disabled")
             self._flac_paths = []
             self._cue_path = None
             self._mode = None
@@ -680,23 +906,14 @@ class App(TkinterDnD.Tk):
         self._video_paths = videos
 
         self._set_info("Files loaded", SAGE)
-        self._convert_btn.configure(state="normal", text="Convert")
-
-        if self._auto_convert_var.get():
-            self._start_conversion()
+        self._start_conversion()
 
     # ------------------------------------------------------------------
     # Status / settings
     # ------------------------------------------------------------------
-    def _set_status(self, text: str) -> None:
-        """Update the convert button text.
-
-        Deliberately colourless: the button is a LIGHT fill with DARK text, so
-        there is no second text colour available for it under the two-colour
-        palette. Use _set_info() when a message needs to read as a warning.
-        """
-        self._convert_btn.configure(text=text)
-        self.update_idletasks()
+    def _set_status(self, text: str, color: str = TEXT) -> None:
+        """Show a transient status message in the drop zone."""
+        self._set_info(text, color)
 
     def _save_settings(self) -> None:
         smod.save({
@@ -707,9 +924,17 @@ class App(TkinterDnD.Tk):
             "monitor_enabled": self._monitor_var.get(),
             "monitor_folder": self._monitor_folder_var.get() or None,
             "torrent_enabled": self._torrent_var.get(),
-            "torrent_download_folder": self._torrent_download_var.get() or None,
-            "torrent_finished_folder": self._torrent_finished_var.get() or None,
             "torrent_delete_source": self._torrent_delete_var.get(),
+            "move_music_enabled": self._move_music_var.get(),
+            "move_music_folder": self._move_music_folder_var.get() or None,
+            "move_video_enabled": self._move_video_var.get(),
+            "move_video_folder": self._move_video_folder_var.get() or None,
+            "sounds_enabled": self._sounds_var.get(),
+            "proxy_enabled": self._proxy_var.get(),
+            "proxy_host": self._proxy_host_var.get().strip() or None,
+            "proxy_port": self._parse_port(self._proxy_port_var.get()),
+            "proxy_username": self._proxy_username_var.get().strip() or None,
+            "proxy_password": self._proxy_password_var.get() or None,
         })
 
     # ------------------------------------------------------------------
@@ -720,16 +945,39 @@ class App(TkinterDnD.Tk):
         if self._is_converting:
             return
         if not check_ffmpeg():
-            self._set_status(
-                "ffmpeg not found. Please install it and ensure it's on your PATH.",
-                WARM,
-            )
+            self._is_converting = True  # block re-entry while fetching
+            self._set_status("Downloading ffmpeg (one-time setup)…", WARM)
+            thread = threading.Thread(target=self._fetch_ffmpeg_then_convert, daemon=True)
+            thread.start()
             return
 
         self._is_converting = True
-        self._convert_btn.configure(state="disabled", text="Converting...")
         self._play_starting()
 
+        thread = threading.Thread(target=self._run_conversion, daemon=True)
+        thread.start()
+
+    def _fetch_ffmpeg_then_convert(self) -> None:
+        """Download ffmpeg/ffprobe (see ffmpeg_fetch.py), then run the queued
+        conversion that triggered the download in the first place."""
+        from ffmpeg_fetch import download as fetch_ffmpeg
+
+        def on_progress(frac: float) -> None:
+            self.after(0, self._set_status, f"Downloading ffmpeg… {int(frac * 100)}%", WARM)
+
+        try:
+            fetch_ffmpeg(on_progress=on_progress)
+        except Exception as e:
+            self.after(0, self._set_status, f"Could not download ffmpeg: {e}", WARM)
+            self.after(0, self._on_ffmpeg_fetch_failed)
+            return
+        self.after(0, self._on_ffmpeg_fetch_done)
+
+    def _on_ffmpeg_fetch_failed(self) -> None:
+        self._is_converting = False
+
+    def _on_ffmpeg_fetch_done(self) -> None:
+        self._play_starting()
         thread = threading.Thread(target=self._run_conversion, daemon=True)
         thread.start()
 
@@ -740,36 +988,15 @@ class App(TkinterDnD.Tk):
         mode      = self._mode
         videos    = self._video_paths[:]
         do_delete = self._delete_var.get()
-
-        # Compute grand total for unified progress
-        audio_units = 0
-        if flacs:
-            if cue:
-                try:
-                    from cue_parser import parse_cue as _pc
-                    audio_units = len(_pc(cue))
-                except Exception:
-                    audio_units = 1
-            else:
-                audio_units = len(flacs)
-        video_units = len(videos)
-        grand_total = max(audio_units + video_units, 1)
-        completed = [0]
-
-        # Register encoding tasks in the Encoding tab
-        self.after(0, self._clear_encoding_progress)
-        for f in flacs:
-            self.after(0, self._add_encoding_progress, f, Path(f).name)
-        for v in videos:
-            self.after(0, self._add_encoding_progress, v, Path(v).name)
+        # Rows for this batch already exist — _enqueue_conversion added them
+        # when it was queued, not now. Keep the ids around so this batch's
+        # rows (and only this batch's) can be cleared once it's done,
+        # leaving any other queued batches' rows on screen untouched.
+        task_ids = flacs + videos
 
         def on_audio_progress(cur: int, total: int) -> None:
-            completed[0] = cur
             if flacs and 0 <= cur - 1 < len(flacs):
-                self.after(0, self._set_converting_file, flacs[cur - 1])
                 self.after(0, self._update_encoding_progress, flacs[cur - 1], 1.0)
-            pct = int(completed[0] / grand_total * 100)
-            self.after(0, self._set_status, f"Conversion Running {pct}%")
 
         _last_video_idx = [-1]
 
@@ -777,21 +1004,23 @@ class App(TkinterDnD.Tk):
             idx = min(int(cur), total - 1)
             if idx != _last_video_idx[0] and 0 <= idx < len(videos):
                 _last_video_idx[0] = idx
-                self.after(0, self._set_converting_file, videos[idx])
             if 0 <= idx < len(videos):
                 frac = cur - int(cur) if cur > 0 else 0.0
                 self.after(0, self._update_encoding_progress, videos[idx], min(frac, 1.0))
-            pct = int((audio_units + cur) / grand_total * 100)
-            self.after(0, self._set_status, f"Conversion Running {pct}%")
 
         try:
             # --- Audio ---
+            audio_outputs: List[str] = []
             if flacs:
                 if cue:
                     tracks = parse_cue(cue)
                     split_and_convert(flacs[0], tracks, on_audio_progress)
                 else:
                     convert_files(flacs, on_audio_progress)
+                # Compute output paths before deleting the CUE file below —
+                # a CUE-mode split needs to re-parse it to name the tracks,
+                # and delete_companion_files() removes that same file.
+                audio_outputs = self._audio_outputs(flacs, cue)
                 if do_delete:
                     delete_flacs(flacs)
                     delete_companion_files(flacs, cue)
@@ -804,46 +1033,91 @@ class App(TkinterDnD.Tk):
                     self._ignore_output(str(video_output_path(Path(v))))
                 transcode_videos(videos, on_video_progress, delete_source=do_delete)
 
-            # Copy converted files to finished folder
-            finished = self._torrent_finished_var.get()
-            if finished and Path(finished).is_dir():
-                outputs = []
-                if flacs:
-                    if cue:
-                        for track in parse_cue(cue):
-                            outputs.append(str(Path(flacs[0]).parent / f"{track.number:02d} - {track.title}.mp3"))
-                    else:
-                        for f in flacs:
-                            outputs.append(str(Path(f).parent / (Path(f).stem + ".mp3")))
-                for v in videos:
-                    outputs.append(str(video_output_path(Path(v))))
-                # The finished folder may sit inside the monitored tree.
-                for o in outputs:
-                    self._ignore_output(str(Path(finished) / Path(o).name))
-                from converter import copy_to_finished
-                copy_to_finished(outputs, finished)
+            video_outputs = self._video_outputs(videos)
+
+            # Move converted files out of the monitored folder, per type.
+            if self._move_music_var.get():
+                dest = self._move_music_folder_var.get()
+                if dest and Path(dest).is_dir():
+                    audio_outputs, warn = self._move_outputs(audio_outputs, dest)
+                    if warn:
+                        self.after(0, self._set_info, warn, WARM)
+            if self._move_video_var.get():
+                dest = self._move_video_folder_var.get()
+                if dest and Path(dest).is_dir():
+                    video_outputs, warn = self._move_outputs(video_outputs, dest)
+                    if warn:
+                        self.after(0, self._set_info, warn, WARM)
+
+            # Record the work so a restart does not repeat it. Outputs are
+            # recorded as well as sources: a finished transcode left in the
+            # monitored folder looks exactly like a new source video to the
+            # startup scan.
+            libmod.mark([
+                p for p in [*flacs, cue, *videos, *audio_outputs, *video_outputs]
+                if p
+            ])
 
             # Done
             self.after(0, self._play_done)
             self.after(0, self._show_done)
-            self.after(3000, self._clear_encoding_progress)
+            self.after(3000, self._remove_encoding_rows, task_ids)
             if do_delete:
                 self.after(3000, self._reset_ui)
 
         except ValueError as e:
-            self.after(0, self._hide_wave_btn, f"Could not parse CUE file: {e}")
+            self.after(0, self._set_info, f"Could not parse CUE file: {e}", WARM)
+            self.after(0, self._remove_encoding_rows, task_ids)
         except RuntimeError as e:
-            self.after(0, self._hide_wave_btn, str(e))
+            self.after(0, self._set_info, str(e), WARM)
+            self.after(0, self._remove_encoding_rows, task_ids)
         except Exception as e:
-            self.after(0, self._hide_wave_btn, f"Unexpected error: {e}")
+            self.after(0, self._set_info, f"Unexpected error: {e}", WARM)
+            self.after(0, self._remove_encoding_rows, task_ids)
         finally:
             self._is_converting = False
-            self.after(0, lambda: self._convert_btn.configure(state="normal"))
             self.after(0, self._process_next_queue_item)
 
-    def _reset_btn_text(self) -> None:
-        """Restore button text to Convert without touching file state."""
-        self._convert_btn.configure(text="Convert")
+    @staticmethod
+    def _audio_outputs(flacs: List[str], cue: Optional[str]) -> List[str]:
+        """MP3 paths this conversion writes: split tracks, or one per source file."""
+        outputs: List[str] = []
+        if flacs:
+            if cue:
+                for track in parse_cue(cue):
+                    outputs.append(str(
+                        Path(flacs[0]).parent
+                        / f"{track.number:02d} - {track.title}.mp3"
+                    ))
+            else:
+                for f in flacs:
+                    outputs.append(str(Path(f).parent / (Path(f).stem + ".mp3")))
+        return outputs
+
+    @staticmethod
+    def _video_outputs(videos: List[str]) -> List[str]:
+        return [str(video_output_path(Path(v))) for v in videos]
+
+    @staticmethod
+    def _conversion_outputs(
+        flacs: List[str], cue: Optional[str], videos: List[str]
+    ) -> List[str]:
+        """Paths this conversion writes: split tracks or MP3s, plus transcodes."""
+        return App._audio_outputs(flacs, cue) + App._video_outputs(videos)
+
+    def _move_outputs(
+        self, paths: List[str], dest: str
+    ) -> Tuple[List[str], Optional[str]]:
+        """Move converted files to *dest*, registering the destinations first.
+
+        Registration happens before the move so the folder monitor — if
+        *dest* sits inside the monitored tree — never treats the arrival as a
+        new source file.
+        """
+        for p in paths:
+            self._ignore_output(str(Path(dest) / Path(p).name))
+        from converter import move_to_folder
+        return move_to_folder(paths, dest)
 
     def _reset_ui(self) -> None:
         """Reset the UI to idle state after a completed conversion.
@@ -857,26 +1131,26 @@ class App(TkinterDnD.Tk):
         self._cue_path = None
         self._mode = None
         self._video_paths = []
-        self._set_info("No files loaded", DIM)
-        self._convert_btn.configure(state="disabled", text="Convert")
+        self._reset_drop_text()
 
     def _draw_wave_drop(self) -> None:
-        """Redraw the drop-zone canvas with a waving 'Drag & Drop' text."""
+        """Redraw the drop-zone canvas with the waving status/prompt text."""
         c = self._drop_canvas
         c.delete("all")
-        text = "Drag & Drop"
         w = c.winfo_width()
         h = c.winfo_height()
         if w < 2 or h < 2:
             return  # canvas not yet realized
-        total_w = sum(self._wave_font_drop.measure(ch) for ch in text)
+        font = self._drop_font
+        text = self._elide(self._drop_text, font, w - 16 * SCALE)
+        total_w = sum(font.measure(ch) for ch in text)
         x = (w - total_w) / 2
         cy = h / 2
         for i, ch in enumerate(text):
-            cw = self._wave_font_drop.measure(ch)
-            y = cy + 4 * math.sin(self._wave_phase + i * 0.6)
-            c.create_text(x + cw / 2, y, text=ch,
-                          font=self._wave_font_drop, fill=DIM, anchor="center")
+            cw = font.measure(ch)
+            y = cy + 4 * SCALE * math.sin(self._wave_phase + i * 0.6)
+            c.create_text(x + cw / 2, y, text=ch, font=font,
+                          fill=self._drop_color, anchor="center")
             x += cw
 
     def _wave_tick(self) -> None:
@@ -885,78 +1159,38 @@ class App(TkinterDnD.Tk):
         self._draw_wave_drop()
         self.after(40, self._wave_tick)
 
-    def _hide_wave_btn(self, text: str) -> None:
-        """Restore normal button text after conversion and freeze any info scroll."""
-        self._convert_btn.configure(text=text)
-        # Stop marquee and show the last filename as static text
-        if self._scroll_active and self._scroll_text:
-            self._set_info(self._scroll_text, self._scroll_color)
+    def _set_info(self, text: str, color: str = DIM, hold_ms: int = 4000) -> None:
+        """Show *text* in the drop zone, reverting to the prompt after a pause.
 
-    def _set_info(self, text: str, color: str) -> None:
-        """Draw static text in the info area and stop any active scroll."""
-        self._scroll_active = False
-        c = self._info_canvas
-        c.delete("all")
-        c.create_text(4, 18, text=text, font=self._wave_font_drop,
-                      fill=color, anchor="w")
-
-    def _start_scroll(self, text: str, color: str) -> None:
-        """Scroll text left in the info area; falls back to static if it fits.
-
-        Uses a dual threshold so long filenames always scroll even when the
-        Silkscreen font fails to register in the bundled exe and tkinter
-        substitutes a narrower fallback (which would otherwise give a false
-        'it fits' measurement).
+        The drop zone is the only status surface left on the main page, so
+        every message — errors included — lands here.
         """
-        font = self._wave_font_drop
-        # Scroll if the text is measurably wide OR simply has many characters.
-        # The character-count guard catches the font-substitution case where
-        # font.measure() under-reports width.
-        if font.measure(text) <= 440 and len(text) <= 35:
-            self._set_info(text, color)
-            return
-        was_active = self._scroll_active
-        self._scroll_active = True
-        self._scroll_text = text
-        self._scroll_color = color
-        self._scroll_x = 0.0                  # start with text flush to left edge
-        if not was_active:
-            self._scroll_tick()               # kick off the loop only once
+        if self._drop_revert_id is not None:
+            self.after_cancel(self._drop_revert_id)
+            self._drop_revert_id = None
+        self._drop_text = text
+        self._drop_color = color
+        self._drop_font = self._fit_drop_font(text)
+        if text != "Drag & Drop":
+            self._drop_revert_id = self.after(hold_ms, self._reset_drop_text)
 
-    def _scroll_tick(self) -> None:
-        """Advance the info-area marquee by one step (self-scheduling, 40 ms)."""
-        if not self._scroll_active:
-            return
-        font = self._wave_font_drop
-        text = self._scroll_text
-        color = self._scroll_color
-        text_w = font.measure(text)
-        gap = 48                              # pixel gap before the repeated copy
+    def _fit_drop_font(self, text: str) -> tkfont.Font:
+        """Largest wave font in which *text* fits the drop zone on one line."""
+        max_px = max(self._drop_canvas.winfo_width() - 16 * SCALE, 100 * SCALE)
+        for font in self._wave_fonts:
+            if font.measure(text) <= max_px:
+                return font
+        return self._wave_fonts[-1]
 
-        self._scroll_x -= 1.5
-        if self._scroll_x <= -(text_w + gap):
-            self._scroll_x = 0.0             # seamless loop: reset to start
-
-        c = self._info_canvas
-        c.delete("all")
-        x = self._scroll_x + 4
-        # primary instance
-        c.create_text(x, 18, text=text, font=font, fill=color, anchor="w")
-        # lookahead copy so the repeat appears before the primary exits
-        c.create_text(x + text_w + gap, 18, text=text, font=font,
-                      fill=color, anchor="w")
-        self.after(40, self._scroll_tick)
-
-    def _set_converting_file(self, path: str) -> None:
-        """Scroll (or show) the currently converting file name in the info area."""
-        self._start_scroll(Path(path).name, SAGE)
+    def _reset_drop_text(self) -> None:
+        self._drop_revert_id = None
+        self._drop_text = "Drag & Drop"
+        self._drop_color = DIM
+        self._drop_font = self._wave_font_drop
 
     def _show_done(self) -> None:
         """Called on successful conversion completion."""
-        self._hide_wave_btn("Done.")
-        # Leave the info label showing the last converted filename so the user
-        # can see what was processed. _reset_ui (auto-called 3 s later when
-        # delete_flac is on, or on next file load) will clear it.
+        self._set_info("Done.", GREEN)
 
     # ------------------------------------------------------------------
     # Tray
@@ -971,9 +1205,22 @@ class App(TkinterDnD.Tk):
         """Called when window is minimized (or hidden). Route to tray if enabled."""
         if event.widget is not self:
             return
-        if self._hiding_to_tray:
-            return
         if not self._tray_var.get():
+            return
+        self._hide_to_tray()
+
+    def _on_close_button(self) -> None:
+        """Handle the window's X button: honor "Minimize to tray" instead of
+        always quitting outright, matching the taskbar-minimize behavior.
+        The new Quit tab is the explicit, always-available way to fully exit."""
+        if self._tray_var.get():
+            self._hide_to_tray()
+        else:
+            self.destroy()
+
+    def _hide_to_tray(self) -> None:
+        """Hide the window and start the tray icon, unless already hidden."""
+        if self._hiding_to_tray:
             return
         self._hiding_to_tray = True
         try:
@@ -1040,7 +1287,6 @@ class App(TkinterDnD.Tk):
             else:
                 self._remove_startup_shortcut()
                 self._set_status("Windows Startup Off")
-            self.after(3000, self._reset_btn_text)
         except Exception as e:
             self._set_status(f"Startup shortcut error: {e}")
             self._startup_var.set(not self._startup_var.get())  # revert
@@ -1120,7 +1366,6 @@ class App(TkinterDnD.Tk):
         if self._monitor_var.get():
             if not folder:
                 self._set_status("Select a folder")
-                self.after(3000, self._reset_btn_text)
                 self._monitor_var.set(False)
                 return
             self._start_monitor(folder)
@@ -1129,7 +1374,6 @@ class App(TkinterDnD.Tk):
             self._monitor_folder_var.set("")
 
     def _browse_monitor_folder(self) -> None:
-        self._play_click()
         folder = filedialog.askdirectory(title="Select folder to monitor")
         if not folder:
             return
@@ -1144,6 +1388,68 @@ class App(TkinterDnD.Tk):
             self._start_torrent_downloader()
         else:
             self._stop_torrent_downloader()
+
+    # ------------------------------------------------------------------
+    # Move music / video to — post-conversion relocation
+    # ------------------------------------------------------------------
+    def _browse_move_music_folder(self) -> None:
+        folder = filedialog.askdirectory(title="Select folder for converted music")
+        if folder:
+            self._move_music_folder_var.set(folder)
+
+    def _browse_move_video_folder(self) -> None:
+        folder = filedialog.askdirectory(title="Select folder for converted video")
+        if folder:
+            self._move_video_folder_var.set(folder)
+
+    def _on_move_music_toggle(self) -> None:
+        self._play_click()
+        if self._move_music_var.get() and not self._move_music_folder_var.get():
+            self._set_status("Select a folder")
+            self._move_music_var.set(False)
+
+    def _on_move_video_toggle(self) -> None:
+        self._play_click()
+        if self._move_video_var.get() and not self._move_video_folder_var.get():
+            self._set_status("Select a folder")
+            self._move_video_var.set(False)
+
+    # ------------------------------------------------------------------
+    # SOCKS5 proxy
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_port(text: str) -> Optional[int]:
+        try:
+            port = int(text.strip())
+        except (ValueError, AttributeError):
+            return None
+        return port if 1 <= port <= 65535 else None
+
+    def _on_proxy_toggle(self) -> None:
+        self._play_click()
+        if self._proxy_var.get():
+            host = self._proxy_host_var.get().strip()
+            port = self._parse_port(self._proxy_port_var.get())
+            if not host or port is None:
+                self._set_status("Enter a valid proxy host and port")
+                self._proxy_var.set(False)
+                return
+            self._check_proxy_reachability_async(host, port)
+        if self._torrent_var.get() and self._torrent_downloader is not None:
+            self._start_torrent_downloader()  # rebuild with the new proxy config
+
+    def _check_proxy_reachability_async(self, host: str, port: int) -> None:
+        def _check():
+            from torrent_downloader import check_proxy_reachable
+            ok = check_proxy_reachable(host, port)
+            self.after(0, self._on_proxy_check_result, ok, host, port)
+        threading.Thread(target=_check, daemon=True).start()
+
+    def _on_proxy_check_result(self, ok: bool, host: str, port: int) -> None:
+        if ok:
+            self._set_status(f"Proxy reachable ({host}:{port})", SAGE)
+        else:
+            self._set_status(f"Proxy unreachable ({host}:{port})", WARM)
 
     # ------------------------------------------------------------------
     # Magnet protocol handler (Windows registry)
@@ -1267,32 +1573,44 @@ class App(TkinterDnD.Tk):
             self._torrent_downloader.add(magnet_uri)
             self._set_status("Added magnet link")
 
-    def _browse_torrent_download_folder(self) -> None:
-        self._play_click()
-        folder = filedialog.askdirectory(title="Select torrent download folder")
-        if folder:
-            self._torrent_download_var.set(folder)
-            if self._torrent_var.get():
-                self._stop_torrent_downloader()
-                self._start_torrent_downloader()
-
-    def _browse_torrent_finished_folder(self) -> None:
-        self._play_click()
-        folder = filedialog.askdirectory(title="Select finished folder")
-        if folder:
-            self._torrent_finished_var.set(folder)
-
     def _start_torrent_downloader(self) -> None:
+        """Start downloading torrents into a staging area inside the monitored
+        folder, invisible to the folder watcher.
+
+        BitTorrent doesn't write pieces in order, so a file's on-disk size
+        can plateau mid-download or jump to near-final early — the watcher's
+        generic "size stopped changing" heuristic can't tell that apart from
+        "actually done." Staging sidesteps the guesswork entirely: nothing
+        moves into the real monitored folder (where the watcher looks) until
+        the download is protocol-confirmed complete. That means monitoring
+        must actually be running, not just configured; otherwise a finished
+        download would have nowhere to be picked up from.
+        """
         self._stop_torrent_downloader()
-        dl = self._torrent_download_var.get()
-        if not dl:
-            self._set_status("Select a download folder")
+        dl = self._monitor_folder_var.get()
+        if not (dl and self._monitor_var.get()):
+            self._set_status("Enable Monitor folder first")
             self._torrent_var.set(False)
             return
+
+        proxy = None
+        if self._proxy_var.get():
+            host = self._proxy_host_var.get().strip()
+            port = self._parse_port(self._proxy_port_var.get())
+            if host and port is not None:
+                proxy = {
+                    "host": host, "port": port,
+                    "username": self._proxy_username_var.get().strip() or None,
+                    "password": self._proxy_password_var.get() or None,
+                }
+
+        staging = Path(dl) / STAGING_DIRNAME
+        staging.mkdir(parents=True, exist_ok=True)
         self._torrent_downloader = TorrentDownloader(
-            dl,
+            str(staging),
             on_progress=self._on_torrent_progress,
             on_complete=self._on_torrent_complete,
+            proxy=proxy,
         )
         self._torrent_downloader.start()
 
@@ -1311,33 +1629,27 @@ class App(TkinterDnD.Tk):
             if tid not in self._torrent_progress_widgets:
                 self._add_torrent_progress_row(tid, name)
             widgets = self._torrent_progress_widgets[tid]
-            widgets["bar"].set(0)
-            widgets["label"].config(text="Error", fg=WARM)
+            widgets["bar"].set(0, "ERROR")
             widgets["name_lbl"].config(fg=WARM)
             self.after(5000, self._remove_torrent_progress, tid)
             return
         if tid not in self._torrent_progress_widgets:
             self._add_torrent_progress_row(tid, name)
-        widgets = self._torrent_progress_widgets[tid]
-        pct = int(progress * 100)
-        widgets["bar"].set(progress)
-        widgets["label"].config(text=f"{pct}%")
+        self._torrent_progress_widgets[tid]["bar"].set(progress)
 
     def _add_torrent_progress_row(self, tid: str, name: str) -> None:
         frame = tk.Frame(self._torrent_progress_frame, bg=DARK)
-        frame.pack(fill="x", padx=2, pady=1)
+        frame.pack(fill="x", padx=2 * SCALE, pady=1 * SCALE)
         short_name = format_torrent_name(name)
         name_lbl = tk.Label(frame, text=short_name, bg=DARK, fg=SAGE,
-                            font=("Silkscreen", 8), anchor="w", width=20)
+                            font=("Silkscreen", 8 * SCALE), anchor="w", width=20)
         name_lbl.pack(side="left")
-        bar = ctk.CTkProgressBar(frame, width=180, height=14)
-        bar.set(0)
-        bar.pack(side="left", padx=(4, 4))
-        pct = tk.Label(frame, text="0%", bg=DARK, fg=TEXT,
-                        font=("Silkscreen", 8), width=4)
-        pct.pack(side="left")
+        # Bars hang off the right edge, clear of the box outline, so every
+        # row's bar lines up whatever its name is.
+        bar = PixelBar(frame)
+        bar.pack(side="right", padx=(4 * SCALE, INNER - 4 * SCALE))
         self._torrent_progress_widgets[tid] = {
-            "frame": frame, "bar": bar, "label": pct, "name_lbl": name_lbl,
+            "frame": frame, "bar": bar, "name_lbl": name_lbl,
         }
 
     def _remove_torrent_progress(self, tid: str) -> None:
@@ -1349,69 +1661,88 @@ class App(TkinterDnD.Tk):
         self.after(0, self._on_torrent_complete_gui, tid, download_path)
 
     def _on_torrent_complete_gui(self, tid: str, download_path: str) -> None:
+        """Move the finished download out of staging and into the monitored folder.
+
+        Downloads land in a staging subfolder the watcher ignores, so nothing
+        here is ever partially written — by the time this runs, the transfer
+        is protocol-confirmed complete (aria2c exit 0 / libtorrent
+        is_finished), not just "file size looks stable." Moving it into the
+        real monitored folder lets the existing watcher pick it up exactly
+        like a manual drop. Directory moves don't generate per-file watchdog
+        events (the handler ignores directory move events), so multi-file
+        torrents need one explicit nudge; single files are picked up
+        naturally once they land.
+        """
         self._remove_torrent_progress(tid)
         monitor_folder = self._monitor_folder_var.get()
-        if (
-            self._monitor is not None
-            and monitor_folder
-            and Path(monitor_folder).is_dir()
-        ):
-            # The folder monitor picks up the copies and converts them —
-            # scanning the download folder too would convert everything twice.
-            self._copy_downloaded_to_monitor(download_path, monitor_folder)
-        else:
-            self._scan_and_convert_downloaded(download_path)
+        if not monitor_folder:
+            return
+        src = Path(download_path)
+        if not src.exists():
+            return
+        try:
+            dest = self._move_into_monitor_folder(src, Path(monitor_folder), tid[:8])
+        except OSError as e:
+            self._set_info(f"Could not move downloaded file: {e}", WARM)
+            return
+        if dest.is_dir():
+            self._enqueue_media_tree(str(dest))
+
+    @staticmethod
+    def _move_into_monitor_folder(src: Path, dest_parent: Path, tag: str) -> Path:
+        """Move *src* into *dest_parent*, resolving same-name collisions.
+
+        shutil.move merges *into* an existing destination directory rather
+        than overwriting it, and raises on Windows for an existing
+        destination file — neither of which should silently lose a freshly
+        downloaded file, so both are handled explicitly.
+        """
+        dest = dest_parent / src.name
+        if not dest.exists():
+            shutil.move(str(src), str(dest))
+            return dest
+        if src.is_dir() and dest.is_dir():
+            for item in src.iterdir():
+                item_dest = dest / item.name
+                if item_dest.exists():
+                    item_dest = dest / f"{item.stem}_{tag}{item.suffix}"
+                shutil.move(str(item), str(item_dest))
+            src.rmdir()
+            return dest
+        disambiguated = dest_parent / f"{src.stem}_{tag}{src.suffix}"
+        shutil.move(str(src), str(disambiguated))
+        return disambiguated
 
     # ------------------------------------------------------------------
-    # Encoding progress (Encoding tab)
+    # Encoding progress (encoding box)
     # ------------------------------------------------------------------
     def _add_encoding_progress(self, task_id: str, name: str) -> None:
         frame = tk.Frame(self._encoding_progress_frame, bg=BG)
-        frame.pack(fill="x", padx=2, pady=1)
-        short_name = name if len(name) <= 25 else name[:22] + "..."
+        frame.pack(fill="x", padx=2 * SCALE, pady=1 * SCALE)
+        short_name = name if len(name) <= 20 else name[:17] + "..."
         name_lbl = tk.Label(frame, text=short_name, bg=BG, fg=SAGE,
-                            font=("Silkscreen", 8), anchor="w", width=25)
+                            font=("Silkscreen", 8 * SCALE), anchor="w", width=20)
         name_lbl.pack(side="left")
-        bar = ctk.CTkProgressBar(frame, width=180, height=14)
-        bar.set(0)
-        bar.pack(side="left", padx=(4, 4))
-        pct = tk.Label(frame, text="0%", bg=BG, fg=TEXT,
-                        font=("Silkscreen", 8), width=4)
-        pct.pack(side="left")
+        bar = PixelBar(frame)
+        bar.pack(side="right", padx=(4 * SCALE, INNER - 4 * SCALE))
         self._encoding_progress_widgets[task_id] = {
-            "frame": frame, "bar": bar, "label": pct, "name_lbl": name_lbl,
+            "frame": frame, "bar": bar, "name_lbl": name_lbl,
         }
 
     def _update_encoding_progress(self, task_id: str, progress: float) -> None:
         widgets = self._encoding_progress_widgets.get(task_id)
         if not widgets:
             return
-        pct = int(progress * 100)
         widgets["bar"].set(progress)
-        widgets["label"].config(text=f"{pct}%")
 
     def _remove_encoding_progress(self, task_id: str) -> None:
         widgets = self._encoding_progress_widgets.pop(task_id, None)
         if widgets:
             widgets["frame"].destroy()
 
-    def _clear_encoding_progress(self) -> None:
-        for task_id in list(self._encoding_progress_widgets):
+    def _remove_encoding_rows(self, task_ids: List[str]) -> None:
+        for task_id in task_ids:
             self._remove_encoding_progress(task_id)
-
-    def _copy_downloaded_to_monitor(self, download_path: str, monitor_folder: str) -> None:
-        dst = Path(monitor_folder)
-        for f in collect_media(download_path):
-            src = Path(f)
-            try:
-                shutil.copy2(str(src), str(dst / src.name))
-            except OSError:
-                pass  # includes copying a file onto itself
-
-    def _scan_and_convert_downloaded(self, download_path: str) -> None:
-        paths = collect_media(download_path)
-        if paths:
-            self._enqueue_conversion(paths)
 
     def _start_monitor(self, folder: str) -> None:
         self._stop_monitor()
@@ -1420,31 +1751,87 @@ class App(TkinterDnD.Tk):
             self._monitor_var.set(False)
             return
         self._monitor = mmod.FolderMonitor(
-            folder, 
+            folder,
             self._on_monitor_files,
             self._on_torrent_files,
+            exclude_dirname=STAGING_DIRNAME,
         )
         try:
             self._monitor.start()
+            self._recover_staged_downloads(folder)
             self._scan_existing_files(folder)
         except Exception as e:
             self._set_status(f"Monitor error: {e}")
             self._monitor_var.set(False)
             self._monitor = None
 
+    def _recover_staged_downloads(self, monitor_folder: str) -> None:
+        """Move complete-looking downloads left behind in torrent staging
+        into the real monitored folder, so they don't sit stuck forever.
+
+        A download normally moves out of staging the instant it finishes
+        (see _on_torrent_complete_gui) — but if Hoarder itself was closed
+        or killed while a download was still in flight, the aria2c/
+        libtorrent process is orphaned and can go on to finish completely
+        with nobody left to notice or move it. aria2c leaves a ".aria2"
+        control file next to any file it hasn't finished writing, and
+        deletes it the moment that file is done — that's aria2c's own
+        authoritative "is this actually complete" signal, so recovery
+        checks for its absence rather than guessing from anything else.
+        Entries that still have one are left alone: still downloading (by
+        an orphaned process) or genuinely interrupted, either way not safe
+        to convert yet.
+        """
+        staging = Path(monitor_folder) / STAGING_DIRNAME
+        if not staging.is_dir():
+            return
+        recovered = 0
+        for entry in list(staging.iterdir()):
+            if entry.suffix == ".aria2":
+                continue  # a control file, never real content on its own
+            if self._has_incomplete_download(entry):
+                continue
+            try:
+                self._move_into_monitor_folder(entry, Path(monitor_folder), "recovered")
+                recovered += 1
+            except OSError:
+                pass  # best-effort; the next monitor start tries again
+        if recovered:
+            plural = "s" if recovered != 1 else ""
+            self._set_info(f"Recovered {recovered} interrupted download{plural}", SAGE)
+
+    @staticmethod
+    def _has_incomplete_download(path: Path) -> bool:
+        """True if aria2c still considers something under *path* unfinished."""
+        if path.is_file():
+            return Path(str(path) + ".aria2").exists()
+        return any(path.rglob("*.aria2"))
+
     def _scan_existing_files(self, folder: str) -> None:
-        """Queue conversion jobs for all audio and video files in the monitored folder.
+        """Queue conversion jobs for everything already sitting in *folder*."""
+        self._enqueue_media_tree(folder)
+
+    def _enqueue_media_tree(self, root: str) -> None:
+        """Queue conversion jobs for all audio and video files under *root*.
 
         Files are grouped by parent directory so each subfolder becomes its own
-        job and all jobs run sequentially via _conversion_queue.
+        job and all jobs run sequentially via _conversion_queue. Used both for
+        the monitor's startup scan (root = the whole monitored folder) and for
+        a just-completed torrent (root = wherever it landed) — either way,
+        anything still sitting in the torrent staging area is skipped, since
+        that means it isn't actually finished downloading yet.
         """
-        folder_path = Path(folder)
+        folder_path = Path(root)
+
+        def _not_staging(p: Path) -> bool:
+            return STAGING_DIRNAME not in p.parts
 
         # --- Audio: collect all supported formats, group by parent directory ---
         audio_by_dir: dict[Path, list[Path]] = {}
         for ext in AUDIO_EXTS:
             for audio in sorted(folder_path.rglob(f"*{ext}")):
-                audio_by_dir.setdefault(audio.parent, []).append(audio)
+                if _not_staging(audio):
+                    audio_by_dir.setdefault(audio.parent, []).append(audio)
         for d in audio_by_dir:
             audio_by_dir[d].sort()
 
@@ -1452,26 +1839,32 @@ class App(TkinterDnD.Tk):
             cue_files = sorted(dir_path.glob("*.cue"))
             if not cue_files:
                 # No CUEs — batch all audio files together
-                self.after(0, self._enqueue_conversion,
+                self.after(0, self._enqueue_new,
                            [str(f) for f in dir_audio])
             else:
                 # Pair CUEs with audio via stem-match + FILE directive fallback
                 pairs = self._pair_cues_flacs(cue_files, dir_audio)
                 paired_audio_set = {audio for audio, _ in pairs}
                 for audio, cue in pairs:
-                    self.after(0, self._enqueue_conversion,
-                               [str(audio), str(cue)])
+                    # The CUE rides along: only the audio is library-checked.
+                    self.after(0, self._enqueue_pair, str(audio), str(cue))
                 lone = [str(f) for f in dir_audio if f not in paired_audio_set]
                 if lone:
-                    self.after(0, self._enqueue_conversion, lone)
+                    self.after(0, self._enqueue_new, lone)
 
         # --- Video: group by parent directory ---
         videos_by_dir: dict[Path, list[str]] = {}
         for pat in ("*.mp4", "*.mkv", "*.mov", "*.wmv", "*.avi"):
             for vid in sorted(folder_path.rglob(pat)):
-                videos_by_dir.setdefault(vid.parent, []).append(str(vid))
+                if _not_staging(vid):
+                    videos_by_dir.setdefault(vid.parent, []).append(str(vid))
         for dir_path in sorted(videos_by_dir):
-            self.after(0, self._enqueue_conversion, videos_by_dir[dir_path])
+            self.after(0, self._enqueue_new, videos_by_dir[dir_path])
+
+    def _enqueue_pair(self, audio: str, cue: str) -> None:
+        """Enqueue an audio+CUE disc unless the audio is already in the library."""
+        if libmod.filter_new([audio]):
+            self._enqueue_conversion([audio, cue])
 
     @staticmethod
     def _pair_cues_flacs(
@@ -1513,17 +1906,39 @@ class App(TkinterDnD.Tk):
 
         return pairs
 
+    def _enqueue_new(self, paths: List[str]) -> None:
+        """Enqueue only the files the library has not already converted.
+
+        Used by every automatic path — the startup scan, the folder watcher and
+        finished torrents — so a restart does not re-encode a folder it has
+        already been through. Files dropped or browsed by hand skip this check:
+        asking for a file explicitly means asking for it to be converted.
+        """
+        fresh = libmod.filter_new(paths)
+        if fresh:
+            self._enqueue_conversion(fresh)
+
     def _enqueue_conversion(self, paths: List[str]) -> None:
         """Validate *paths* and add them to the conversion queue.
 
         Silently ignores batches that detect_mode rejects (e.g. unsupported
         types arriving from the file-system watcher).  If nothing is currently
         converting, starts processing immediately.
+
+        Encoding rows for the whole batch appear right away, not once it
+        actually starts converting — so queuing up several folders at once
+        (e.g. every disc of a multi-folder torrent) shows the full pending
+        list immediately instead of revealing one folder at a time as each
+        prior one finishes.
         """
-        _, _, _, _, error = detect_mode(paths)
+        _, flacs, _, videos, error = detect_mode(paths)
         if error:
             return
         self._conversion_queue.append(paths)
+        for f in flacs:
+            self.after(0, self._add_encoding_progress, f, Path(f).name)
+        for v in videos:
+            self.after(0, self._add_encoding_progress, v, Path(v).name)
         self._process_next_queue_item()
 
     def _process_next_queue_item(self) -> None:
@@ -1577,7 +1992,7 @@ class App(TkinterDnD.Tk):
         paths = [p for p in paths if not self._claim_ignored(p)]
         if not paths:
             return
-        self.after(0, self._enqueue_conversion, paths)
+        self.after(0, self._enqueue_new, paths)
 
     def _on_torrent_files(self, paths: List[str]) -> None:
         """Called from watchdog thread when torrent files arrive."""
