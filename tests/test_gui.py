@@ -520,6 +520,7 @@ def test_startup_scan_skips_torrent_staging_folder(tmp_path):
 
 import types
 import shutil as _shutil
+import gui as gui_mod
 from gui import App as _App
 
 
@@ -1044,6 +1045,224 @@ class _MutableVar:
 
     def set(self, value):
         self._value = value
+
+
+# --- Windows startup registration (HKCU Run value, no subprocess) ---
+
+class _FakeRegistry:
+    """Enough of winreg to exercise the startup code off Windows.
+
+    The real thing is unavailable here and conftest's stub raises on every
+    read, so neither can show that the right value lands under the right key.
+    """
+
+    HKEY_CURRENT_USER = 0
+    KEY_ALL_ACCESS = 0xF003F
+    REG_SZ = 1
+
+    def __init__(self, initial=None, create_raises=None):
+        self.values = dict(initial or {})
+        self.create_raises = create_raises
+
+    class _Key:
+        def __init__(self, reg, path):
+            self.reg, self.path = reg, path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def CreateKey(self, hive, path):
+        if self.create_raises:
+            raise self.create_raises
+        return self._Key(self, path)
+
+    def OpenKey(self, hive, path, reserved=0, access=0):
+        if path not in {k[0] for k in self.values}:
+            raise FileNotFoundError(path)
+        return self._Key(self, path)
+
+    def SetValueEx(self, key, name, reserved, typ, value):
+        self.values[(key.path, name)] = value
+
+    def QueryValueEx(self, key, name):
+        try:
+            return self.values[(key.path, name)], self.REG_SZ
+        except KeyError:
+            raise FileNotFoundError(name)
+
+    def DeleteValue(self, key, name):
+        if (key.path, name) not in self.values:
+            raise FileNotFoundError(name)
+        del self.values[(key.path, name)]
+
+
+_RUN_KEY = _App._STARTUP_RUN_KEY
+
+
+class _StartupHost:
+    _on_startup_toggle = _App._on_startup_toggle
+    _enable_startup = _App._enable_startup
+    _disable_startup = _App._disable_startup
+    _clear_legacy_startup = _App._clear_legacy_startup
+    _registered_startup_command = _App._registered_startup_command
+    _check_stale_startup_entry = _App._check_stale_startup_entry
+    _startup_command = classmethod(_App._startup_command.__func__)
+    _startup_target = staticmethod(_App._startup_target)
+    _STARTUP_RUN_KEY = _App._STARTUP_RUN_KEY
+    _STARTUP_VALUE = _App._STARTUP_VALUE
+    _LEGACY_STARTUP_VALUE = _App._LEGACY_STARTUP_VALUE
+    _LEGACY_LNK_NAMES = _App._LEGACY_LNK_NAMES
+
+    def __init__(self, enabled=True, startup_folder=None):
+        self._startup_var = _MutableVar(enabled)
+        self._sound_volume = 100
+        self.status_calls = []
+        self._folder = startup_folder
+
+    def _startup_folder(self):
+        return self._folder if self._folder is not None else Path("/nonexistent")
+
+    def _play_checkbox(self):
+        pass
+
+    def _set_status(self, text, color=None):
+        self.status_calls.append(text)
+
+
+@pytest.fixture
+def fake_reg(monkeypatch):
+    reg = _FakeRegistry()
+    monkeypatch.setattr(gui_mod, "winreg", reg)
+    return reg
+
+
+def test_enabling_startup_writes_a_run_value(fake_reg):
+    host = _StartupHost()
+    host._enable_startup()
+    assert fake_reg.values[(_RUN_KEY, "Plunder")] == host._startup_command()
+
+
+def test_the_startup_command_asks_for_the_tray(fake_reg):
+    assert _StartupHost._startup_command().endswith("--tray")
+
+
+def test_a_dev_run_names_the_script_host_explicitly(fake_reg):
+    """Run values go through CreateProcess, which cannot start a .vbs on its
+    own the way a shortcut's file association could."""
+    cmd = _StartupHost._startup_command()
+    assert cmd.startswith("wscript.exe ")
+    assert cmd.split('"')[1].endswith("run.vbs")
+
+
+def test_disabling_startup_removes_the_run_value(fake_reg):
+    host = _StartupHost()
+    host._enable_startup()
+    host._disable_startup()
+    assert (_RUN_KEY, "Plunder") not in fake_reg.values
+
+
+def test_disabling_startup_when_it_was_never_on_is_not_an_error(fake_reg):
+    _StartupHost()._disable_startup()   # must not raise
+
+
+def test_disabling_startup_also_clears_the_pre_rename_value(fake_reg):
+    """Otherwise the app keeps starting itself under its old name."""
+    fake_reg.values[(_RUN_KEY, "Hoarder")] = r'"C:\old\Hoarder.exe" --tray'
+    host = _StartupHost()
+    host._disable_startup()
+    assert (_RUN_KEY, "Hoarder") not in fake_reg.values
+
+
+def test_disabling_startup_deletes_the_old_startup_folder_shortcuts(tmp_path, fake_reg):
+    lnk = tmp_path / "Plunder.lnk"
+    old = tmp_path / "Hoarder.lnk"
+    lnk.write_bytes(b"shortcut")
+    old.write_bytes(b"shortcut")
+
+    _StartupHost(startup_folder=tmp_path)._disable_startup()
+
+    assert not lnk.exists()
+    assert not old.exists()
+
+
+def test_a_stale_run_value_is_repointed_at_this_build(fake_reg):
+    """The command is a snapshot of sys.executable from when the box was
+    ticked; rebuilding elsewhere leaves Windows launching nothing."""
+    fake_reg.values[(_RUN_KEY, "Plunder")] = r'"C:\somewhere\else\Plunder.exe" --tray'
+    host = _StartupHost(enabled=True)
+    host._check_stale_startup_entry()
+    assert fake_reg.values[(_RUN_KEY, "Plunder")] == host._startup_command()
+
+
+def test_a_current_run_value_is_left_alone(fake_reg):
+    host = _StartupHost(enabled=True)
+    host._enable_startup()
+    before = dict(fake_reg.values)
+    host._check_stale_startup_entry()
+    assert fake_reg.values == before
+
+
+def test_nothing_is_registered_when_the_setting_is_off(fake_reg):
+    _StartupHost(enabled=False)._check_stale_startup_entry()
+    assert fake_reg.values == {}
+
+
+def test_a_refused_registry_write_reverts_the_checkbox(fake_reg, monkeypatch):
+    """What the PowerShell version did instead was raise out of __init__."""
+    monkeypatch.setattr(
+        gui_mod, "winreg",
+        _FakeRegistry(create_raises=PermissionError("[WinError 5] Access is denied")),
+    )
+    host = _StartupHost(enabled=True)
+    host._on_startup_toggle()
+    assert host._startup_var.get() is False
+    assert any("Windows Startup error" in s for s in host.status_calls)
+
+
+def test_the_startup_check_never_spawns_a_process(fake_reg, monkeypatch):
+    """A blocked spawn is what crashed the app at launch — there is now
+    nothing here for Windows to refuse."""
+    import subprocess
+
+    def _boom(*a, **k):
+        raise AssertionError("startup registration must not spawn a process")
+
+    monkeypatch.setattr(subprocess, "run", _boom)
+    monkeypatch.setattr(subprocess, "Popen", _boom)
+    host = _StartupHost(enabled=True)
+    host._check_stale_startup_entry()
+    host._disable_startup()
+
+
+def test_the_gui_module_spawns_no_processes_at_all():
+    """The two startup helpers were the only subprocess users in gui.py.
+
+    Keeping it at zero is the point: an unsigned executable that launches
+    PowerShell is a textbook malware signature, and a refused spawn is what
+    crashed the app at startup. Conversions go through converter.py, torrent
+    transfers through torrent_downloader.py — neither belongs here.
+    """
+    import ast
+
+    source = Path(gui_mod.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    spawns = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = ast.unparse(node.func)
+            if name.split(".")[-1] in {"run", "Popen", "call", "check_output",
+                                       "system", "startfile", "execv", "spawnv"}:
+                if "subprocess" in name or name.startswith("os."):
+                    spawns.append(name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            mod = getattr(node, "module", None) or ""
+            names = [a.name for a in node.names]
+            if mod == "subprocess" or "subprocess" in names:
+                spawns.append(f"import {mod or names}")
+    assert spawns == []
 
 
 class _TorrentAssocHost:

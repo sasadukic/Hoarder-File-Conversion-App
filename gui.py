@@ -430,8 +430,16 @@ class App(TkinterDnD.Tk):
 
         self._preload_sounds()
         self._build_ui()
-        self._check_stale_startup_shortcut()
-        self._check_stale_handlers()
+        # Both of these repair registrations an earlier build left pointing
+        # somewhere else. Neither is worth a crash: they run before the window
+        # exists, so anything escaping here dies as a bare traceback with no UI
+        # to report it — which is exactly how a refused PowerShell spawn used
+        # to take the whole app down at launch.
+        for _repair in (self._check_stale_startup_entry, self._check_stale_handlers):
+            try:
+                _repair()
+            except Exception:
+                pass
         # After _build_ui, so the monitor and downloader it restores are
         # already up and the startup folder scan has had its say.
         self.after(200, self._restore_session)
@@ -1888,88 +1896,127 @@ class App(TkinterDnD.Tk):
         self.focus_force()
 
     # ------------------------------------------------------------------
-    # Windows startup shortcut
+    # Windows startup registration
     # ------------------------------------------------------------------
+    # A value under HKCU's Run key, not a .lnk in the Startup folder.
+    # Creating or reading a shortcut means COM, which meant shelling out to
+    # powershell.exe — and Windows refusing that spawn (Defender blocking an
+    # unsigned exe from launching PowerShell is enough on its own) raised
+    # PermissionError out of a cosmetic startup check and killed the app
+    # before its window ever appeared. The registry needs no subprocess at
+    # all, and it is how every other Windows integration here already works.
+    #
+    # It also removes the behaviour itself: an unsigned executable that
+    # launches PowerShell at startup is a textbook malware signature, and
+    # this app has enough trouble with antivirus heuristics already.
+    _STARTUP_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    _STARTUP_VALUE = "Plunder"
+    _LEGACY_STARTUP_VALUE = "Hoarder"        # pre-rename value name
+    _LEGACY_LNK_NAMES = ("Plunder.lnk", "Hoarder.lnk")
+
     def _on_startup_toggle(self) -> None:
         self._play_checkbox()
         try:
             if self._startup_var.get():
-                self._create_startup_shortcut()
+                self._enable_startup()
                 self._set_status("Windows Startup On")
             else:
-                self._remove_startup_shortcut()
+                self._disable_startup()
                 self._set_status("Windows Startup Off")
         except Exception as e:
-            self._set_status(f"Startup shortcut error: {e}")
+            self._set_status(f"Windows Startup error: {e}")
             self._startup_var.set(not self._startup_var.get())  # revert
 
     @staticmethod
-    def _startup_lnk_path() -> Path:
+    def _startup_folder() -> Path:
+        """The Startup folder — only needed now to clear out old shortcuts."""
         import os
-        startup = (
+        return (
             Path(os.environ["APPDATA"])
             / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
         )
-        return startup / "Plunder.lnk"
 
     @staticmethod
-    def _run_bat_path() -> Path:
-        # When running as a PyInstaller bundle, point the startup shortcut at
-        # the exe itself rather than the dev-only run.vbs script.
+    def _startup_target() -> Path:
+        # Frozen: the exe itself. Otherwise the dev-only silent launcher.
         if getattr(sys, "frozen", False):
             return Path(sys.executable)
         return Path(__file__).parent / "run.vbs"
 
-    def _create_startup_shortcut(self) -> None:
-        """Create a .lnk in the Windows Startup folder with --tray argument."""
-        import subprocess
-        lnk = str(self._startup_lnk_path())
-        target = str(self._run_bat_path().resolve())
-        ps = (
-            f'$s=(New-Object -COM WScript.Shell).CreateShortcut("{lnk}");'
-            f'$s.TargetPath="{target}";'
-            f'$s.Arguments="--tray";'
-            f'$s.Save()'
-        )
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
-            capture_output=True, text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "PowerShell error")
+    @classmethod
+    def _startup_command(cls) -> str:
+        """The command line Windows should run at logon."""
+        target = cls._startup_target().resolve()
+        if getattr(sys, "frozen", False):
+            return f'"{target}" --tray'
+        # Values under Run are handed to CreateProcess, which cannot start a
+        # .vbs the way a shortcut's file association could — name the script
+        # host explicitly.
+        return f'wscript.exe "{target}" --tray'
 
-    def _remove_startup_shortcut(self) -> None:
-        self._startup_lnk_path().unlink(missing_ok=True)
-        # Clean up a shortcut left over from before the app was renamed.
-        (self._startup_lnk_path().parent / "Hoarder.lnk").unlink(missing_ok=True)
+    def _enable_startup(self) -> None:
+        """Register this build to start with Windows, minimized to tray."""
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, self._STARTUP_RUN_KEY) as key:
+            winreg.SetValueEx(
+                key, self._STARTUP_VALUE, 0, winreg.REG_SZ, self._startup_command()
+            )
+        self._clear_legacy_startup()
 
-    def _check_stale_startup_shortcut(self) -> None:
-        """Recreate startup shortcut if it exists but points to wrong path."""
+    def _disable_startup(self) -> None:
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, self._STARTUP_RUN_KEY,
+                0, winreg.KEY_ALL_ACCESS,
+            ) as key:
+                winreg.DeleteValue(key, self._STARTUP_VALUE)
+        except FileNotFoundError:
+            pass  # already absent, which is the state being asked for
+        self._clear_legacy_startup()
+
+    def _clear_legacy_startup(self) -> None:
+        """Drop autostart left behind by earlier builds.
+
+        Both the Startup-folder shortcut the PowerShell version wrote and the
+        pre-rename Run value. Without this, switching the setting off would
+        leave the app still starting itself at logon by the old route.
+        """
+        for name in self._LEGACY_LNK_NAMES:
+            try:
+                (self._startup_folder() / name).unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, self._STARTUP_RUN_KEY,
+                0, winreg.KEY_ALL_ACCESS,
+            ) as key:
+                winreg.DeleteValue(key, self._LEGACY_STARTUP_VALUE)
+        except OSError:
+            pass
+
+    def _registered_startup_command(self) -> Optional[str]:
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, self._STARTUP_RUN_KEY
+            ) as key:
+                val, _ = winreg.QueryValueEx(key, self._STARTUP_VALUE)
+                return val
+        except OSError:
+            return None
+
+    def _check_stale_startup_entry(self) -> None:
+        """Re-point the logon entry at this build if it no longer matches.
+
+        Same reasoning as _check_stale_handlers: the command is a snapshot of
+        sys.executable from whenever the box was ticked, so rebuilding or
+        moving the exe leaves Windows launching something that is not there.
+        """
         if not self._startup_var.get():
             return
-        lnk = self._startup_lnk_path()
-        if not lnk.exists():
-            try:
-                self._create_startup_shortcut()
-            except Exception:
-                pass
+        if self._registered_startup_command() == self._startup_command():
+            self._clear_legacy_startup()
             return
-        import subprocess
-        target_expected = str(self._run_bat_path().resolve())
-        ps = f'(New-Object -COM WScript.Shell).CreateShortcut("{lnk}").TargetPath'
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
-            capture_output=True, text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        if result.returncode == 0:
-            current_target = result.stdout.strip()
-            if current_target != target_expected:
-                try:
-                    self._create_startup_shortcut()
-                except Exception:
-                    pass
+        self._enable_startup()
 
     # ------------------------------------------------------------------
     # Folder monitor

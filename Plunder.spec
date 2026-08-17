@@ -26,8 +26,6 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    # UPX-packed sections are one of the strongest generic-heuristic signals
-    # Windows Defender has; the few MB saved are not worth a quarantine.
     upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
@@ -37,8 +35,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:\\Users\\psilo\\Desktop\\Audio Convert\\hoarder.ico'],
-    # An exe with no version resource is another cheap "freshly packed
-    # binary" signal — see build.py's docstring.
     version='C:\\Users\\psilo\\Desktop\\Audio Convert\\version_info.txt',
+    icon=['C:\\Users\\psilo\\Desktop\\Audio Convert\\hoarder.ico'],
 )
