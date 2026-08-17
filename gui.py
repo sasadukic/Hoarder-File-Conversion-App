@@ -1631,18 +1631,34 @@ class App(TkinterDnD.Tk):
             video_outputs = self._video_outputs(videos)
 
             # Move converted files out of the monitored folder, per type.
+            audio_moved = False
             if self._move_music_var.get():
                 dest = self._move_music_folder_var.get()
                 if dest and Path(dest).is_dir():
                     audio_outputs, warn = self._move_outputs(audio_outputs, dest)
+                    audio_moved = True
                     if warn:
                         self.after(0, self._set_info, warn, WARM)
+            video_moved = False
             if self._move_video_var.get():
                 dest = self._move_video_folder_var.get()
                 if dest and Path(dest).is_dir():
                     video_outputs, warn = self._move_outputs(video_outputs, dest)
+                    video_moved = True
                     if warn:
                         self.after(0, self._set_info, warn, WARM)
+
+            # Flag the finished work with " Done" so it reads as complete at
+            # a glance, before marking it in the library — mark() needs the
+            # paths it is given to still exist.
+            audio_outputs = self._flag_encoded_done(
+                Path(flacs[0]).parent if flacs else None,
+                audio_outputs, audio_moved,
+            )
+            video_outputs = self._flag_encoded_done(
+                Path(videos[0]).parent if videos else None,
+                video_outputs, video_moved, is_video=True,
+            )
 
             # Record the work so a restart does not repeat it. Outputs are
             # recorded as well as sources: a finished transcode left in the
@@ -1674,6 +1690,66 @@ class App(TkinterDnD.Tk):
             self._active_batch = None
             self.after(0, self._save_session)
             self.after(0, self._process_next_queue_item)
+
+    def _flag_encoded_done(
+        self,
+        source_dir: Optional[Path],
+        outputs: List[str],
+        moved: bool,
+        is_video: bool = False,
+    ) -> List[str]:
+        """Append " Done" to finished output(s) so they read as complete at
+        a glance.
+
+        Renames the shared source folder once, covering every output inside
+        it in one go — but only when the whole batch lived in a dedicated
+        subfolder (an album or a movie's own folder) that outputs weren't
+        just relocated out of; the monitored folder's own root and a
+        move-to destination are both shared by unrelated batches, so
+        neither has a single folder that belongs only to this one. In
+        those cases each output file is flagged individually instead. A
+        directory rename never reaches the folder watcher (it ignores
+        directory move events outright); a file rename does, so a renamed
+        video — still a video by extension — is registered as this app's
+        own output first, same as the original write was.
+        """
+        if not outputs:
+            return outputs
+        monitor_root = self._monitor_folder_var.get()
+        monitor_root_path = Path(monitor_root) if monitor_root else None
+        if (
+            not moved
+            and source_dir is not None
+            and source_dir != monitor_root_path
+            and not source_dir.name.endswith(" Done")
+        ):
+            try:
+                renamed_dir = source_dir.rename(
+                    source_dir.with_name(source_dir.name + " Done")
+                )
+            except OSError:
+                pass
+            else:
+                return [
+                    str(renamed_dir / Path(p).relative_to(source_dir))
+                    for p in outputs
+                ]
+        result = []
+        for p in outputs:
+            path = Path(p)
+            if path.stem.endswith(" Done"):
+                result.append(p)
+                continue
+            new_path = path.with_name(f"{path.stem} Done{path.suffix}")
+            if is_video:
+                self._ignore_output(str(new_path))
+            try:
+                path.rename(new_path)
+            except OSError:
+                result.append(p)
+                continue
+            result.append(str(new_path))
+        return result
 
     @staticmethod
     def _audio_outputs(flacs: List[str], cue: Optional[str]) -> List[str]:

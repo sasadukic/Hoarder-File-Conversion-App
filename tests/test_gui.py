@@ -662,6 +662,118 @@ def test_move_into_monitor_folder_merges_colliding_directory(tmp_path):
     assert (dest / "02.flac").read_bytes() == b"new track two"
 
 
+# --- flagging finished output with " Done" ---
+
+class _FlagDoneHost:
+    _flag_encoded_done = App._flag_encoded_done
+
+    def __init__(self, monitor_folder=""):
+        self._monitor_folder_var = _MutableVar(monitor_folder)
+        self.ignored = []
+
+    def _ignore_output(self, path):
+        self.ignored.append(path)
+
+
+def test_flag_done_renames_the_shared_source_folder(tmp_path):
+    """A dedicated album/movie folder gets one rename covering every file."""
+    album = tmp_path / "Monitor" / "Some Album"
+    album.mkdir(parents=True)
+    (album / "01.mp3").write_bytes(b"one")
+    (album / "02.mp3").write_bytes(b"two")
+
+    host = _FlagDoneHost(monitor_folder=str(tmp_path / "Monitor"))
+    outputs = host._flag_encoded_done(
+        album, [str(album / "01.mp3"), str(album / "02.mp3")], moved=False,
+    )
+
+    renamed = tmp_path / "Monitor" / "Some Album Done"
+    assert renamed.is_dir()
+    assert not album.exists()
+    assert set(outputs) == {str(renamed / "01.mp3"), str(renamed / "02.mp3")}
+
+
+def test_flag_done_flags_files_individually_at_the_monitor_root(tmp_path):
+    """Loose files sitting directly in the monitored folder share it with
+    unrelated batches, so there is no single folder to rename."""
+    monitor = tmp_path / "Monitor"
+    monitor.mkdir()
+    (monitor / "track.mp3").write_bytes(b"one")
+
+    host = _FlagDoneHost(monitor_folder=str(monitor))
+    outputs = host._flag_encoded_done(monitor, [str(monitor / "track.mp3")], moved=False)
+
+    assert outputs == [str(monitor / "track Done.mp3")]
+    assert (monitor / "track Done.mp3").exists()
+    assert not (monitor / "track.mp3").exists()
+
+
+def test_flag_done_flags_files_individually_when_moved_elsewhere(tmp_path):
+    """A move-to-folder destination is shared by every batch that uses it,
+    same reasoning as the monitor root — even though the source folder was
+    its own dedicated album folder."""
+    album = tmp_path / "Monitor" / "Some Album"
+    album.mkdir(parents=True)
+    dest = tmp_path / "Library"
+    dest.mkdir()
+    (dest / "song.mp3").write_bytes(b"moved already")
+
+    host = _FlagDoneHost(monitor_folder=str(tmp_path / "Monitor"))
+    outputs = host._flag_encoded_done(album, [str(dest / "song.mp3")], moved=True)
+
+    assert outputs == [str(dest / "song Done.mp3")]
+    assert album.exists()  # untouched — only the moved file was flagged
+
+
+def test_flag_done_registers_video_outputs_before_renaming(tmp_path):
+    """A renamed video is still a video by extension, so the watcher would
+    otherwise treat the rename as a newly arrived source file."""
+    monitor = tmp_path / "Monitor"
+    monitor.mkdir()
+    (monitor / "movie.mp4").write_bytes(b"video")
+
+    host = _FlagDoneHost(monitor_folder=str(monitor))
+    outputs = host._flag_encoded_done(
+        monitor, [str(monitor / "movie.mp4")], moved=False, is_video=True,
+    )
+
+    assert outputs == [str(monitor / "movie Done.mp4")]
+    assert host.ignored == [str(monitor / "movie Done.mp4")]
+
+
+def test_flag_done_does_not_double_flag_an_already_flagged_folder(tmp_path):
+    album = tmp_path / "Monitor" / "Some Album Done"
+    album.mkdir(parents=True)
+    (album / "01.mp3").write_bytes(b"one")
+
+    host = _FlagDoneHost(monitor_folder=str(tmp_path / "Monitor"))
+    outputs = host._flag_encoded_done(album, [str(album / "01.mp3")], moved=False)
+
+    # Folder rename is skipped (already flagged); falls back to per-file,
+    # which flags the file since *it* isn't flagged yet.
+    assert album.is_dir()
+    assert outputs == [str(album / "01 Done.mp3")]
+
+
+def test_flag_done_does_not_double_flag_an_already_flagged_file(tmp_path):
+    monitor = tmp_path / "Monitor"
+    monitor.mkdir()
+    (monitor / "track Done.mp3").write_bytes(b"one")
+
+    host = _FlagDoneHost(monitor_folder=str(monitor))
+    outputs = host._flag_encoded_done(
+        monitor, [str(monitor / "track Done.mp3")], moved=False,
+    )
+
+    assert outputs == [str(monitor / "track Done.mp3")]
+
+
+def test_flag_done_is_a_noop_with_no_outputs(tmp_path):
+    host = _FlagDoneHost(monitor_folder=str(tmp_path))
+    assert host._flag_encoded_done(tmp_path, [], moved=False) == []
+    assert host.ignored == []
+
+
 # --- CUE-mode output paths must be computed before the CUE file is deleted ---
 #
 # _run_conversion used to call _audio_outputs(flacs, cue) *after*
