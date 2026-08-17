@@ -2,6 +2,7 @@ import array
 import io
 import math
 import os
+import random
 import sys
 import tempfile
 import winreg
@@ -86,14 +87,34 @@ PAD      = 8 * SCALE     # gap between the tab outline and a box, and between bo
 INNER    = 10 * SCALE    # gap between a box outline and its contents
 TAB_W    = 468 * SCALE   # tabview width
 DROP_H   = 72 * SCALE
+# The drop zone grows upward into its own top margin: it gets taller without
+# pushing the downloads/encoding boxes down, so PAGE_H stays as computed below.
+DROP_RISE = 8 * SCALE
+# The drop zone ran out of room at the page's top edge — ctk pins the page to
+# 2px below the tab chips, and the chips' height is driven by the 32px tab
+# font, not by any height setting. The last 2px therefore come from thinning
+# the chips' border (3px -> BORDER), which lifts the page by exactly this
+# much. Every page-relative y BELOW the drop zone is pushed back down by the
+# same amount, so only the drop zone's top edge actually moves on screen.
+PAGE_LIFT = 2 * SCALE
+# The Setup tab's content box tracks the drop zone: it rises by the same total
+# the drop zone gained, growing upward from a fixed bottom edge so the two
+# tabs' boxes still end level with each other.
+SETUP_RISE = DROP_RISE + PAGE_LIFT
 LIST_H   = 148 * SCALE   # downloads box and encoding box
+CORNER_R = 4 * SCALE     # corner radius of the white boxes and the tab chips
 
 # customtkinter's tabview spends a fixed 36px on its tab strip regardless of
 # widget scaling (that's baked into CTkTabview's own class constants, not
 # something a border_width/font choice can resize) — only the border-driven
 # padding around the page content actually scales with BORDER below.
 BORDER = 2 * SCALE
-_TAB_CHROME_H = 36 + 2 * BORDER
+# Measured against the 36px-tall segmented button (32px tab font): 10px of
+# top padding + 46px rendered button (ctk adds its own internal padding to
+# the configured 36) + 2px gap before the page. Too small a value here
+# CLIPS the page's bottom — the encoding box's lower outline simply doesn't
+# render — because the pages get TAB_H minus this chrome to draw in.
+_TAB_CHROME_H = 58 * SCALE
 _TAB_CHROME_W = 2 * BORDER
 SCROLL_INSET = 8 * SCALE   # gap between a scroll box's outline and its CTkScrollableFrame
 
@@ -101,8 +122,28 @@ PAGE_W   = TAB_W - _TAB_CHROME_W
 PAGE_H   = PAD + DROP_H + PAD + LIST_H + PAD + LIST_H + PAD
 BOX_W    = PAGE_W - 2 * PAD
 TAB_H    = PAGE_H + _TAB_CHROME_H
-WINDOW_W = TAB_W + 2 * PAD * 2
-WINDOW_H = TAB_H + 2 * PAD
+# Side margin between the window edge and the tabview — wide enough for
+# the 48px corner skulls straddling the border line to fit unclipped.
+SIDE_M = 24 * SCALE
+WINDOW_W = TAB_W + 2 * SIDE_M
+# Extra bottom room so the bottom chain run and corner skulls — dropped
+# 16px below the tabview edge to clear the encoding box — aren't clipped
+# by the window edge.
+WINDOW_H = TAB_H + 2 * PAD + 30 * SCALE
+
+
+def _corner_steps(radius: int) -> tuple:
+    """Pixel-art quarter circle: how many pixels to knock out of each row,
+    working inward from a box corner, to round it at `radius`.
+
+    radius 4 -> (4, 2, 1, 1); radius 2 -> (2, 1). Symmetric in x/y, so the
+    same tuple describes both the rows and the columns of the corner.
+    """
+    r = max(int(radius), 0)
+    return tuple(
+        sum(1 for dx in range(r) if (r - dx) ** 2 + (r - dy) ** 2 > r * r)
+        for dy in range(r)
+    )
 
 
 class PixelBar(tk.Label):
@@ -180,6 +221,35 @@ class PixelBar(tk.Label):
 
         self._photo = ImageTk.PhotoImage(img)
         self.configure(image=self._photo)
+
+
+class PixelSlider(PixelBar):
+    """PixelBar the user can drag: click anywhere on the track to set the
+    value. Same hard-cornered, inverted-digits look as the progress bars."""
+
+    def __init__(self, master, on_change=None, on_commit=None,
+                 width: int = BAR_W, height: int = BAR_H):
+        super().__init__(master, width=width, height=height)
+        self._on_change = on_change
+        self._on_commit = on_commit
+        self.configure(cursor="hand2")
+        self.bind("<Button-1>", self._on_drag)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    def _value_from_event(self, event) -> float:
+        raw = min(max((event.x - 1) / (self._bar_w - 2), 0.0), 1.0)
+        return round(raw * 10) / 10  # snap to 10% steps
+
+    def _on_drag(self, event) -> None:
+        value = self._value_from_event(event)
+        self.set(value)
+        if self._on_change:
+            self._on_change(value)
+
+    def _on_release(self, event) -> None:
+        if self._on_commit:
+            self._on_commit(self._value)
 
 
 def format_torrent_name(name: str, limit: int = 20) -> str:
@@ -290,7 +360,7 @@ class App(TkinterDnD.Tk):
         ctk.set_widget_scaling(1.0)
         ctk.set_window_scaling(1.0)
 
-        self.title("Hoarder")
+        self.title("Plunder")
         self.geometry(f"{WINDOW_W}x{WINDOW_H}")
         self.resizable(False, False)
         self.configure(bg=BG)
@@ -319,20 +389,27 @@ class App(TkinterDnD.Tk):
         self._preload_sounds()
         self._build_ui()
         self._check_stale_startup_shortcut()
+        self._check_stale_handlers()
         if self._start_in_tray:
             self._go_to_tray()
         else:
             self.deiconify()  # show now that UI is fully ready
+            self.after(600, self._maybe_prompt_torrent_association)
+        self._play_startup()
 
     def _build_ui(self) -> None:
         s = self._settings
+        self._torrent_ext_asked = s.get("torrent_ext_association_asked", False)
 
         # Wave animation state (drop zone only)
         self._wave_phase: float = 0.0
-        self._wave_font_drop = tkfont.Font(family="Silkscreen", size=16 * SCALE)
+        # Alkhemikal has a much smaller x-height than Silkscreen, so the
+        # sizes here are roughly double the old Silkscreen ones for the
+        # same visual weight.
+        self._wave_font_drop = tkfont.Font(family="Alkhemikal", size=32 * SCALE)
         # Smaller steps so a long status message shrinks instead of eliding.
         self._wave_fonts = [self._wave_font_drop] + [
-            tkfont.Font(family="Silkscreen", size=n * SCALE) for n in (12, 10, 8)
+            tkfont.Font(family="Alkhemikal", size=n * SCALE) for n in (24, 20, 16)
         ]
         # The drop zone doubles as the status line: messages replace the
         # "Drag & Drop" text for a few seconds, then it reverts.
@@ -349,28 +426,185 @@ class App(TkinterDnD.Tk):
             fg_color=BG,
             corner_radius=0,
             border_width=BORDER,
+            border_color=BG,  # the chain replaces the visible outline
             segmented_button_fg_color=DARK,
             segmented_button_selected_color=LIGHT,
             segmented_button_unselected_color=DARK,
+            # Hover visuals are handled by _poll_tab_hover, which drives
+            # BOTH the box fill and the text color from one place. ctk's
+            # own event-driven hover is neutralized (hover color == base
+            # color) — when its events misfired, it repainted only the
+            # fill, producing dark-text-on-dark-box mismatches.
             segmented_button_selected_hover_color=LIGHT,
             segmented_button_unselected_hover_color=DARK,
             text_color=LIGHT,
         )
-        self._tabview.place(x=2 * PAD, y=PAD)
+        self._tabview.place(x=SIDE_M, y=PAD)
         self._tabview.configure(command=self._on_tab_changed)
-        # Deliberately NOT scaled with the rest of the UI: the segmented
-        # button's own height is one of CTkTabview's fixed internal
-        # constants (~26px, unaffected by border_width or widget_scaling
-        # while widget_scaling stays at 1.0), so a doubled font would just
-        # get clipped inside an unchanged-height button.
+        # The segmented button's default height (~26px) would clip a 32px
+        # font, so raise its height along with the font size.
+        # corner_radius stays 0: ctk rounds all four corners uniformly, but a
+        # tab chip wants square shoulders where it meets the outline, so the
+        # top corners are rounded by hand in _round_tab_corners instead.
         self._tabview._segmented_button.configure(
-            font=("Silkscreen", 16),
+            font=("Alkhemikal", 32), height=36, corner_radius=0,
+            border_width=BORDER,
         )
 
         main_tab = self._tabview.add("Main")
         self._tabview.add("Setup")
         self._tabview.add("Quit")
+        self._hovered_tab: Optional[str] = None
+        self._hover_misses = 0
         self._update_tab_colors()
+
+        # Hover handling is deliberately NOT event-driven: a CTk tab
+        # button is composite (a canvas plus a text label), so one mouse
+        # pass fires Enter/Leave storms as the pointer crosses its internal
+        # parts — every event-based attempt at "play the sound once per
+        # hover" broke on some crossing pattern. Instead a lightweight
+        # poll checks which tab is under the pointer and reacts only to
+        # actual transitions: enter a different tab → restyle + one sound;
+        # leave the bar → restore colors, no sound. CTkButton's own
+        # background-hover stays event-driven inside ctk, which is fine —
+        # only the text color and the sound need transition accuracy.
+        self.after(200, self._poll_tab_hover)
+
+        # ------------------------------------------------------------------
+        # Decorative chain border running along the tabview's gray outline.
+        # Created AFTER the tabview so it draws on top of the outline
+        # itself (the tabview would otherwise paint over it). The outline's
+        # top edge passes through the vertical center of the tab selector
+        # row, so the top run is split into two segments that stop short of
+        # the menu tabs — the tabs always stay clear of the chain. The
+        # corner skulls are created after this block, so they sit on top.
+        # ------------------------------------------------------------------
+        # The outline's top edge passes through the vertical center of the
+        # segmented button — measure it rather than deriving it from the
+        # fixed chrome constant, since the button's height was raised to
+        # fit the 32px tab font and no longer matches that constant.
+        self.update_idletasks()
+        _seg_btn = self._tabview._segmented_button
+        tab_row_center_y = PAD + _seg_btn.winfo_y() + _seg_btn.winfo_height() // 2
+        # Bottom run sits fully below the encoding box's bottom outline:
+        # 5px clearance (matching the side runs' gap to the boxes) plus
+        # half the 10px chain thickness. The page's y inside the window is
+        # found by walking winfo_y() up the widget tree — winfo_rooty() is
+        # not reliable here because the window is still withdrawn during
+        # _build_ui.
+        _page_y, _w = 0, main_tab
+        while _w is not self:
+            _page_y += _w.winfo_y()
+            _w = _w.master
+        if _page_y <= 0:  # geometry not yet computed — conservative fallback
+            _page_y = PAD + _TAB_CHROME_H
+        bottom_line_y = _page_y + PAGE_H - PAD + 20 * SCALE
+
+        self._chain_photos: List[ImageTk.PhotoImage] = []
+        chain_path = Path(__file__).parent / "chain.png"
+        if chain_path.exists():
+            chain_scale = 2 * SCALE
+            tile_h = Image.open(str(chain_path)).convert("RGBA")
+            tile_h = tile_h.resize(
+                (tile_h.width * chain_scale, tile_h.height * chain_scale), Image.NEAREST,
+            )
+            tile_v = tile_h.transpose(Image.ROTATE_90)
+
+            left_border_x = SIDE_M
+            right_border_x = SIDE_M + TAB_W
+            bottom_border_y = bottom_line_y
+
+            def _tiled_strip(tile_img: Image.Image, length: int, horizontal: bool) -> Image.Image:
+                tw, th = tile_img.size
+                if horizontal:
+                    strip = Image.new("RGBA", (length, th), (0, 0, 0, 0))
+                    for x in range(0, length, tw):
+                        strip.paste(tile_img, (x, 0), tile_img)
+                else:
+                    strip = Image.new("RGBA", (tw, length), (0, 0, 0, 0))
+                    for y in range(0, length, th):
+                        strip.paste(tile_img, (0, y), tile_img)
+                return strip
+
+            def _place_chain(strip_img: Image.Image, x: int, y: int) -> tk.Label:
+                photo = ImageTk.PhotoImage(strip_img)
+                self._chain_photos.append(photo)
+                lbl = tk.Label(self, image=photo, bg=BG, borderwidth=0)
+                lbl.place(x=x, y=y)
+                return lbl
+
+            # Verticals run from the top outline (tab-row center) down to
+            # the bottom outline; bottom run spans the full width.
+            v_len = bottom_border_y - tab_row_center_y
+            _place_chain(
+                _tiled_strip(tile_v, v_len, False),
+                left_border_x - tile_v.width // 2, tab_row_center_y,
+            )
+            _place_chain(
+                _tiled_strip(tile_v, v_len, False),
+                right_border_x - tile_v.width // 2, tab_row_center_y,
+            )
+            self._bottom_chain_label = _place_chain(
+                _tiled_strip(tile_h, right_border_x - left_border_x, True),
+                left_border_x, bottom_border_y - tile_h.height // 2,
+            )
+
+            # Top run: two segments flanking the tab selector.
+            self.update_idletasks()
+            seg_w = self._tabview._segmented_button.winfo_reqwidth()
+            center_x = SIDE_M + TAB_W // 2
+            tab_gap = 6 * SCALE
+            top_y = tab_row_center_y - tile_h.height // 2
+            left_len = center_x - seg_w // 2 - tab_gap - left_border_x
+            if left_len > 0:
+                _place_chain(_tiled_strip(tile_h, left_len, True), left_border_x, top_y)
+            right_start = center_x + seg_w // 2 + tab_gap
+            right_len = right_border_x - right_start
+            if right_len > 0:
+                _place_chain(_tiled_strip(tile_h, right_len, True), right_start, top_y)
+
+        # Decorative skull icons on all four corners of the outline: the
+        # top pair level with the tab bar, the bottom pair on the bottom
+        # outline corners, each centered on the left/right border line.
+        # The right-side ones are the same image mirrored horizontally.
+        self._skull_photo_left: Optional[ImageTk.PhotoImage] = None
+        self._skull_photo_right: Optional[ImageTk.PhotoImage] = None
+        skull_path = Path(__file__).parent / "skull.png"
+        if skull_path.exists():
+            skull_size = 48 * SCALE
+            # tab_row_center_y measured above, from the segmented button;
+            # bottom pair matches the chain's lowered bottom run.
+            bottom_border_y = bottom_line_y
+            left_border_x = SIDE_M
+            right_border_x = SIDE_M + TAB_W
+            left_x = left_border_x - skull_size // 2 + 4
+            right_x = right_border_x - skull_size // 2 - 4
+
+            skull_img = Image.open(str(skull_path)).convert("RGBA")
+            skull_img = skull_img.resize((skull_size, skull_size), Image.NEAREST)
+            self._skull_photo_left = ImageTk.PhotoImage(skull_img)
+            skull_img_flipped = skull_img.transpose(Image.FLIP_LEFT_RIGHT)
+            self._skull_photo_right = ImageTk.PhotoImage(skull_img_flipped)
+
+            self._bottom_skull_labels: List[tk.Label] = []
+            for photo, x, y_center, is_bottom in (
+                (self._skull_photo_left, left_x, tab_row_center_y, False),
+                (self._skull_photo_right, right_x, tab_row_center_y, False),
+                (self._skull_photo_left, left_x, bottom_border_y, True),
+                (self._skull_photo_right, right_x, bottom_border_y, True),
+            ):
+                lbl = tk.Label(self, image=photo, bg=BG, borderwidth=0)
+                lbl.place(x=x, y=y_center - skull_size // 2)
+                if is_bottom:
+                    self._bottom_skull_labels.append(lbl)
+
+        # The bottom run's position is re-measured against the encoding
+        # box's REAL bottom edge once the window is first mapped — the
+        # build-time estimate above can be off in the frozen build, where
+        # page geometry may not have propagated yet while the window is
+        # still withdrawn. Any mismatch in the vertical runs' length that
+        # this correction leaves behind hides under the corner skulls.
+        self.bind("<Map>", self._position_bottom_decor, add="+")
 
         # ------------------------------------------------------------------
         # Main tab — drop zone, downloads box, encoding box
@@ -379,7 +613,10 @@ class App(TkinterDnD.Tk):
             main_tab, bg=PANEL,
             highlightbackground=TEAL, highlightthickness=BORDER, cursor="hand2",
         )
-        self._drop_frame.place(x=PAD, y=PAD, width=BOX_W, height=DROP_H)
+        drop_y, drop_h = 0, DROP_H + DROP_RISE + PAGE_LIFT
+        self._drop_frame.place(x=PAD, y=drop_y, width=BOX_W, height=drop_h)
+        self._notch_corners(main_tab, PAD, drop_y, BOX_W, drop_h)
+        self._weather_outline(main_tab, PAD, drop_y, BOX_W, drop_h, seed=7)
 
         self._drop_canvas = tk.Canvas(
             self._drop_frame, bg=PANEL, highlightthickness=0, cursor="hand2",
@@ -393,7 +630,7 @@ class App(TkinterDnD.Tk):
 
         # Both progress lists scroll: a large monitored folder registers one
         # row per file, which would otherwise render off the bottom of the box.
-        dl_y = PAD + DROP_H + PAD
+        dl_y = PAGE_LIFT + PAD + DROP_H + PAD
         self._torrent_progress_frame = self._make_scroll_box(
             main_tab, PAD, dl_y, BOX_W, LIST_H,
         )
@@ -418,7 +655,10 @@ class App(TkinterDnD.Tk):
         # tab's progress boxes), since the proxy section below pushes the
         # content taller than the box.
         setup_tab = self._tabview.tab("Setup")
-        setup_box = self._make_scroll_box(setup_tab, PAD, PAD, BOX_W, PAGE_H - 2 * PAD)
+        setup_box = self._make_scroll_box(
+            setup_tab, PAD, PAGE_LIFT + PAD - SETUP_RISE, BOX_W,
+            PAGE_H - 2 * PAD + SETUP_RISE,
+        )
 
         row_w = BOX_W - SCROLL_INSET   # matches _make_scroll_box's own inner inset
 
@@ -437,7 +677,7 @@ class App(TkinterDnD.Tk):
             rows[name] = y
             y += ROW_PITCH
         y += GAP
-        for name in ("torrent", "torrent_delete", "magnet"):
+        for name in ("torrent", "torrent_delete", "magnet", "torrent_ext"):
             rows[name] = y
             y += ROW_PITCH
         y += GAP
@@ -467,9 +707,29 @@ class App(TkinterDnD.Tk):
         self._sounds_var = tk.BooleanVar(value=s.get("sounds_enabled", True))
         self._sounds_check = ctk.CTkCheckBox(
             setup_box, text="Sounds",
-            variable=self._sounds_var, command=self._play_click, **_ck,
+            variable=self._sounds_var, command=self._play_checkbox, **_ck,
         )
         self._sounds_check.place(x=INNER, y=rows["sounds"])
+
+        # Volume slider, same look as the progress bars. Live drag only
+        # re-renders the percent display; the (comparatively expensive)
+        # re-render of every wav at the new volume runs once on release,
+        # followed by a sample sound at the new level as feedback.
+        self._sound_volume = int(s.get("sound_volume", 100))
+
+        def _volume_commit(value: float) -> None:
+            self._sound_volume = int(round(value * 100))
+            self._preload_sounds(volume=value)
+            self._save_settings()
+            self._play_checkbox()
+
+        self._volume_slider = PixelSlider(
+            setup_box, on_commit=_volume_commit,
+        )
+        self._volume_slider.set(self._sound_volume / 100)
+        self._volume_slider.place(
+            x=row_w - BAR_W - INNER, y=rows["sounds"] + 2 * SCALE,
+        )
 
         # --- Monitor folder + what happens to converted output ---
         saved_folder = s["monitor_folder"] or ""
@@ -486,7 +746,7 @@ class App(TkinterDnD.Tk):
         self._delete_var = tk.BooleanVar(value=s["delete_flac"])
         self._delete_check = ctk.CTkCheckBox(
             setup_box, text="Delete file after conversion",
-            variable=self._delete_var, command=self._play_click, **_ck,
+            variable=self._delete_var, command=self._play_checkbox, **_ck,
         )
         self._delete_check.place(x=INNER, y=rows["delete"])
 
@@ -520,16 +780,23 @@ class App(TkinterDnD.Tk):
         self._torrent_delete_var = tk.BooleanVar(value=s.get("torrent_delete_source", False))
         self._torrent_delete_check = ctk.CTkCheckBox(
             setup_box, text="Delete torrent file after adding",
-            variable=self._torrent_delete_var, command=self._play_click, **_ck,
+            variable=self._torrent_delete_var, command=self._play_checkbox, **_ck,
         )
         self._torrent_delete_check.place(x=INNER, y=rows["torrent_delete"])
 
         self._magnet_handler_var = tk.BooleanVar(value=self._is_magnet_handler_registered())
         self._magnet_handler_check = ctk.CTkCheckBox(
-            setup_box, text="Open magnet links in Hoarder",
+            setup_box, text="Open magnet links in Plunder",
             variable=self._magnet_handler_var, command=self._on_magnet_handler_toggle, **_ck,
         )
         self._magnet_handler_check.place(x=INNER, y=rows["magnet"])
+
+        self._torrent_ext_var = tk.BooleanVar(value=self._is_torrent_ext_handler_registered())
+        self._torrent_ext_check = ctk.CTkCheckBox(
+            setup_box, text="Open .torrent files in Plunder",
+            variable=self._torrent_ext_var, command=self._on_torrent_ext_handler_toggle, **_ck,
+        )
+        self._torrent_ext_check.place(x=INNER, y=rows["torrent_ext"])
 
         # --- SOCKS5 proxy ---
         self._proxy_host_var = tk.StringVar(value=s.get("proxy_host") or "")
@@ -545,18 +812,28 @@ class App(TkinterDnD.Tk):
             variable=self._proxy_var, command=self._on_proxy_toggle, **_ck,
         )
         self._proxy_check.place(x=INNER, y=rows["proxy_enabled"])
+        # One shared entry column: without it each field's width would be
+        # dictated by its own label, leaving Host/Port longer than
+        # Username/Password.
+        _entry_font = tkfont.Font(family="Silkscreen", size=-16 * SCALE)
+        proxy_entry_x = INNER + max(
+            _entry_font.measure(t) for t in ("Host", "Port", "Username", "Password")
+        ) + 10 * SCALE
         self._make_entry_row(
             setup_box, rows["proxy_host"], "Host", self._proxy_host_var, row_w,
+            entry_x=proxy_entry_x,
         )
         self._make_entry_row(
             setup_box, rows["proxy_port"], "Port", self._proxy_port_var, row_w,
+            entry_x=proxy_entry_x,
         )
         self._make_entry_row(
             setup_box, rows["proxy_user"], "Username", self._proxy_username_var, row_w,
+            entry_x=proxy_entry_x,
         )
         self._make_entry_row(
             setup_box, rows["proxy_pass"], "Password", self._proxy_password_var, row_w,
-            show="*",
+            show="*", entry_x=proxy_entry_x,
         )
 
         # --- Settings traces ---
@@ -567,7 +844,7 @@ class App(TkinterDnD.Tk):
             self._torrent_var, self._torrent_delete_var,
             self._move_music_var, self._move_music_folder_var,
             self._move_video_var, self._move_video_folder_var,
-            self._magnet_handler_var,
+            self._magnet_handler_var, self._torrent_ext_var,
             self._proxy_var, self._proxy_host_var, self._proxy_port_var,
             self._proxy_username_var, self._proxy_password_var,
         ):
@@ -599,6 +876,80 @@ class App(TkinterDnD.Tk):
     # ------------------------------------------------------------------
     # Scrollable, outlined progress boxes
     # ------------------------------------------------------------------
+    def _position_bottom_decor(self, _event=None) -> None:
+        """Pin the bottom chain run and skulls just below the encoding
+        box's real bottom outline (5px clearance, like the side runs)."""
+        box = getattr(self._encoding_progress_frame, "_outer_box", None)
+        if box is None or not getattr(self, "_bottom_chain_label", None):
+            return
+        try:
+            self.update_idletasks()
+            box_bottom = box.winfo_rooty() - self.winfo_rooty() + box.winfo_height()
+        except Exception:
+            return
+        if box_bottom <= 0:
+            return
+        line_y = box_bottom + 15 * SCALE
+        chain_h = self._bottom_chain_label.winfo_reqheight()
+        self._bottom_chain_label.place_configure(y=line_y - chain_h // 2)
+        for lbl in getattr(self, "_bottom_skull_labels", []):
+            lbl.place_configure(y=line_y - lbl.winfo_reqheight() // 2)
+
+    @staticmethod
+    def _notch_corners(
+        parent, x: int, y: int, w: int, h: int, radius: int = CORNER_R,
+    ) -> None:
+        """Knock a pixel-art quarter circle out of each corner of a box
+        outline so the hard rectangle reads as rounded at `radius`.
+
+        One background-colored strip per row of the quarter circle, mirrored
+        into all four corners.
+        """
+        for row, run in enumerate(_corner_steps(radius)):
+            for cx in (x, x + w - run):
+                for cy in (y + row, y + h - row - 1):
+                    tk.Frame(parent, bg=BG, width=run, height=1).place(x=cx, y=cy)
+
+    @staticmethod
+    def _weather_outline(
+        parent, x: int, y: int, w: int, h: int, seed: int,
+        drops_only: bool = False, step_lo: int = 40, step_hi: int = 90,
+    ) -> None:
+        """Hand-worn box outline: knock out the odd pixel, nudge another.
+
+        Deterministic per box (seeded RNG) so the wear pattern is part of
+        the design rather than reshuffling every launch. A "pixel" here is
+        BORDER-sized to match the chunky outline width.
+        """
+        rng = random.Random(seed)
+        n = BORDER
+        edges = (
+            ("h", x + 6 * SCALE, x + w - 6 * SCALE, y),           # top
+            ("h", x + 6 * SCALE, x + w - 6 * SCALE, y + h - n),   # bottom
+            ("v", y + 6 * SCALE, y + h - 6 * SCALE, x),           # left
+            ("v", y + 6 * SCALE, y + h - 6 * SCALE, x + w - n),   # right
+        )
+        for kind, a0, a1, c in edges:
+            pos = a0
+            while True:
+                pos += rng.randint(step_lo, step_hi)
+                # Each worn patch runs 2-4 chunky pixels along the edge.
+                seg = rng.randint(2, 4) * n
+                if pos + seg >= a1:
+                    break
+                if kind == "h":
+                    tk.Frame(parent, bg=BG, width=seg, height=n).place(x=pos, y=c)
+                    if not drops_only and rng.random() < 0.6:
+                        tk.Frame(parent, bg=LIGHT, width=seg, height=n).place(
+                            x=pos, y=c + n * rng.choice((1, -1)),
+                        )
+                else:
+                    tk.Frame(parent, bg=BG, width=n, height=seg).place(x=c, y=pos)
+                    if not drops_only and rng.random() < 0.6:
+                        tk.Frame(parent, bg=LIGHT, width=n, height=seg).place(
+                            x=c + n * rng.choice((1, -1)), y=pos,
+                        )
+
     @staticmethod
     def _make_scroll_box(
         parent, x: int, y: int, w: int, h: int
@@ -612,6 +963,8 @@ class App(TkinterDnD.Tk):
             parent, bg=BG, highlightbackground=TEAL, highlightthickness=BORDER,
         )
         box.place(x=x, y=y, width=w, height=h)
+        App._notch_corners(parent, x, y, w, h)
+        App._weather_outline(parent, x, y, w, h, seed=x * 31 + y * 17 + w)
         inner = ctk.CTkScrollableFrame(
             box, width=w - SCROLL_INSET, height=h - SCROLL_INSET,
             fg_color=BG, corner_radius=0,
@@ -621,6 +974,7 @@ class App(TkinterDnD.Tk):
         )
         inner.pack(fill="both", expand=True)
         inner._scrollbar.grid_forget()
+        inner._outer_box = box  # for post-map decor positioning
         return inner
 
     def _make_folder_row(
@@ -689,7 +1043,7 @@ class App(TkinterDnD.Tk):
 
     def _make_entry_row(
         self, parent, y: int, label: str, var: tk.StringVar, row_w: int,
-        show: Optional[str] = None,
+        show: Optional[str] = None, entry_x: Optional[int] = None,
     ) -> ctk.CTkEntry:
         """Label + editable text field on one line — the typed-value
         analogue of _make_folder_row, for settings that need real input
@@ -700,7 +1054,8 @@ class App(TkinterDnD.Tk):
         )
         name_lbl.place(x=INNER, y=y + 4 * SCALE, height=24 * SCALE)
 
-        entry_x = INNER + name_font.measure(label) + 10 * SCALE
+        if entry_x is None:
+            entry_x = INNER + name_font.measure(label) + 10 * SCALE
         entry_w = max(row_w - entry_x - INNER, 60 * SCALE)
         entry = ctk.CTkEntry(
             parent, textvariable=var, show=show,
@@ -708,6 +1063,13 @@ class App(TkinterDnD.Tk):
             text_color=LIGHT, corner_radius=0, width=entry_w, height=28 * SCALE,
         )
         entry.place(x=entry_x, y=y)
+        # Entries keep the tighter 2px round — a 4px corner is too much
+        # curve on a 28px-tall field.
+        self._notch_corners(parent, entry_x, y, entry_w, 28 * SCALE, radius=2 * SCALE)
+        self._weather_outline(
+            parent, entry_x, y, entry_w, 28 * SCALE, seed=y * 13 + 5,
+            drops_only=True, step_lo=70, step_hi=140,
+        )
         return entry
 
     # ------------------------------------------------------------------
@@ -715,23 +1077,139 @@ class App(TkinterDnD.Tk):
     # ------------------------------------------------------------------
     def _on_tab_changed(self) -> None:
         if self._tabview.get() == "Quit":
-            self.after(0, self.destroy)
+            self.after(0, self._quit_app)
             return
+        self._play_click()
         self._update_tab_colors()
+
+    def _tab_under_pointer(self) -> Optional[str]:
+        """Name of the tab button currently under the mouse, if any.
+
+        Resolved with winfo_containing rather than pointer-vs-rootx
+        arithmetic: the latter mixes coordinate spaces under DPI scaling /
+        multiple monitors (measured: pointer inside a button while the
+        comparison said otherwise), while winfo_containing and
+        winfo_pointerx are consistent with each other by construction.
+        """
+        try:
+            w = self.winfo_containing(self.winfo_pointerx(), self.winfo_pointery())
+            buttons = self._tabview._segmented_button._buttons_dict
+            while w is not None:
+                for name, btn in buttons.items():
+                    if w is btn:
+                        return name
+                w = getattr(w, "master", None)
+        except Exception:
+            pass
+        return None
+
+    def _poll_tab_hover(self) -> None:
+        """Reconcile hover state against where the pointer actually is.
+
+        Runs every 80ms. Entering a different tab plays the hover sound once
+        and lights that chip; leaving the tab bar restores colors silently.
+
+        The fill is re-asserted on EVERY tick while the pointer sits on a
+        tab, not just on the transition: ctk's own Enter/Leave handlers
+        repaint the button canvas whenever the pointer crosses between a
+        chip's internal canvas and text label, which used to leave the chip
+        unfilled with no transition for the poll to react to. Re-asserting
+        is a no-op unless the color actually drifted, so it never flickers.
+
+        winfo_containing also reports None for the odd tick while the
+        pointer is still over a tab (grabs, DPI rounding); two consecutive
+        misses are required before dropping the hover, so a single blip no
+        longer unfills the chip and replays the sound.
+        """
+        try:
+            if not self.winfo_exists():
+                return
+            # Reconcile the selection too: ctk's set() does not fire the
+            # tabview's command, so a programmatic tab change would otherwise
+            # leave the chips carrying the previous selection's text colors —
+            # dark-on-dark and light-on-light, i.e. invisible labels.
+            selected = self._tabview.get()
+            if selected != getattr(self, "_painted_tab", None):
+                self._painted_tab = selected
+                self._update_tab_colors()
+
+            name = self._tab_under_pointer()
+            if name is None and self._hovered_tab is not None:
+                self._hover_misses += 1
+                if self._hover_misses < 2:
+                    name = self._hovered_tab  # ignore a one-tick blip
+            else:
+                self._hover_misses = 0
+
+            if name != self._hovered_tab:
+                self._hovered_tab = name
+                self._update_tab_colors()
+                if name is not None:
+                    self._play_hover()
+            elif name is not None:
+                self._paint_tab(name, lit=True)
+        except Exception:
+            pass
+        self.after(80, self._poll_tab_hover)
+
+    def _paint_tab(self, name: str, lit: bool) -> None:
+        """Give one tab chip its lit (DARK on LIGHT) or unlit look.
+
+        hover_color is set to match fg_color so ctk's own hover repaint —
+        which fires on its own schedule and can land after ours — can only
+        ever repaint the chip in the color it already has.
+        """
+        try:
+            btn = self._tabview._segmented_button._buttons_dict[name]
+            fg, text = (LIGHT, DARK) if lit else (DARK, LIGHT)
+            if (btn.cget("fg_color"), btn.cget("hover_color"),
+                    btn.cget("text_color")) != (fg, fg, text):
+                btn.configure(fg_color=fg, hover_color=fg, text_color=text)
+            self._round_tab_corners(btn)
+        except Exception:
+            pass  # private API — never let a ctk change break the app
 
     def _update_tab_colors(self) -> None:
         """Selected chip: DARK text on LIGHT bg; unselected: LIGHT text on DARK.
 
         customtkinter's segmented button only supports a single text color for
-        all segments, so recolor the per-tab buttons directly.
+        all segments, so recolor the per-tab buttons directly. The hovered tab
+        lights up the same way the selected one does.
         """
         try:
             seg = self._tabview._segmented_button
             selected = self._tabview.get()
-            for name, btn in seg._buttons_dict.items():
-                btn.configure(text_color=DARK if name == selected else LIGHT)
+            for name in seg._buttons_dict:
+                self._paint_tab(name, lit=name in (selected, self._hovered_tab))
         except Exception:
             pass  # private API — never let a ctk change break the app
+
+    def _round_tab_corners(self, btn) -> None:
+        """Round the TOP corners of a tab chip's fill by 4px, once per chip.
+
+        Same pixel-art quarter circle the white boxes use, knocked out in the
+        tab strip's own background color — so it shapes the white fill and is
+        invisible while the chip is dark. Only the top corners: the bottom of
+        a chip meets the outline and stays square.
+        """
+        if getattr(btn, "_corner_bits", None):
+            return
+        # ctk draws the fill inset by the button's border width, so the
+        # knockouts have to start there rather than at the widget edge.
+        bw = btn.cget("border_width")
+        bits = []
+        for row, run in enumerate(_corner_steps(CORNER_R)):
+            for relx, anchor in ((0.0, "nw"), (1.0, "ne")):
+                bit = tk.Frame(
+                    btn, bg=DARK, width=run, height=1,
+                    borderwidth=0, highlightthickness=0,
+                )
+                bit.place(
+                    relx=relx, x=bw if relx == 0.0 else -bw,
+                    y=bw + row, anchor=anchor,
+                )
+                bits.append(bit)
+        btn._corner_bits = bits
 
     # ------------------------------------------------------------------
     # Text truncation helpers — prevent UI overflow on status/info
@@ -769,14 +1247,34 @@ class App(TkinterDnD.Tk):
             wf.writeframes(frames)
         return buf.getvalue()
 
-    def _preload_sounds(self) -> None:
+    _TORRENT_DONE_SOUNDS = (
+        "torrent downloaded-001.wav",
+        "torrent downloaded-002.wav",
+        "torrent downloaded-003.wav",
+        "torrent downloaded-004.wav",
+    )
+
+    def _preload_sounds(self, volume: Optional[float] = None) -> None:
+        if volume is None:
+            volume = self._settings.get("sound_volume", 100) / 100
         self._sound_paths: Dict[str, str] = {}
-        self._sound_tmp_dir = tempfile.mkdtemp(prefix="hoarder_snd_")
-        for name in ("Click.wav", "Done.wav", "Starting.wav"):
+        if not hasattr(self, "_sound_tmp_dir"):
+            self._sound_tmp_dir = tempfile.mkdtemp(prefix="hoarder_snd_")
+        names = (
+            "app quit.wav",
+            "app_startup.wav",
+            "checkbox.wav",
+            "click.wav",
+            "hover.wav",
+            "transcoding done.wav",
+            "when torrent added.wav",
+            *self._TORRENT_DONE_SOUNDS,
+        )
+        for name in names:
             p = Path(__file__).parent / name
             if p.exists():
                 try:
-                    data = self._load_wav_at_volume(str(p), 1.0)
+                    data = self._load_wav_at_volume(str(p), volume)
                     tmp = str(Path(self._sound_tmp_dir) / name)
                     with open(tmp, "wb") as f:
                         f.write(data)
@@ -798,13 +1296,25 @@ class App(TkinterDnD.Tk):
         ).start()
 
     def _play_click(self) -> None:
-        self._play("Click.wav")
+        self._play("click.wav")
+
+    def _play_checkbox(self) -> None:
+        self._play("checkbox.wav")
+
+    def _play_hover(self) -> None:
+        self._play("hover.wav")
+
+    def _play_startup(self) -> None:
+        self._play("app_startup.wav")
 
     def _play_done(self) -> None:
-        self._play("Done.wav")
+        self._play("transcoding done.wav")
 
-    def _play_starting(self) -> None:
-        self._play("Starting.wav")
+    def _play_torrent_added(self) -> None:
+        self._play("when torrent added.wav")
+
+    def _play_torrent_downloaded(self) -> None:
+        self._play(random.choice(self._TORRENT_DONE_SOUNDS))
 
     # ------------------------------------------------------------------
     # Drop / browse
@@ -930,18 +1440,19 @@ class App(TkinterDnD.Tk):
             "move_video_enabled": self._move_video_var.get(),
             "move_video_folder": self._move_video_folder_var.get() or None,
             "sounds_enabled": self._sounds_var.get(),
+            "sound_volume": self._sound_volume,
             "proxy_enabled": self._proxy_var.get(),
             "proxy_host": self._proxy_host_var.get().strip() or None,
             "proxy_port": self._parse_port(self._proxy_port_var.get()),
             "proxy_username": self._proxy_username_var.get().strip() or None,
             "proxy_password": self._proxy_password_var.get() or None,
+            "torrent_ext_association_asked": self._torrent_ext_asked,
         })
 
     # ------------------------------------------------------------------
     # Conversion
     # ------------------------------------------------------------------
     def _start_conversion(self) -> None:
-        self._play_click()
         if self._is_converting:
             return
         if not check_ffmpeg():
@@ -952,8 +1463,6 @@ class App(TkinterDnD.Tk):
             return
 
         self._is_converting = True
-        self._play_starting()
-
         thread = threading.Thread(target=self._run_conversion, daemon=True)
         thread.start()
 
@@ -977,7 +1486,6 @@ class App(TkinterDnD.Tk):
         self._is_converting = False
 
     def _on_ffmpeg_fetch_done(self) -> None:
-        self._play_starting()
         thread = threading.Thread(target=self._run_conversion, daemon=True)
         thread.start()
 
@@ -1196,7 +1704,7 @@ class App(TkinterDnD.Tk):
     # Tray
     # ------------------------------------------------------------------
     def _on_tray_toggle(self) -> None:
-        self._play_click()
+        self._play_checkbox()
         """If tray is unchecked while window is hidden, restore immediately."""
         if not self._tray_var.get() and self._tray_icon is not None:
             self._restore_from_tray()
@@ -1215,6 +1723,30 @@ class App(TkinterDnD.Tk):
         The new Quit tab is the explicit, always-available way to fully exit."""
         if self._tray_var.get():
             self._hide_to_tray()
+        else:
+            self._quit_app()
+
+    def _quit_app(self) -> None:
+        """Quit, playing the quit sound first if sounds are on.
+
+        The window hides immediately so quitting still feels instant; the
+        process just lingers invisibly for the sound's duration, since
+        destroy() would kill the process before an async PlaySound gets a
+        chance to be heard.
+        """
+        if getattr(self, "_quitting", False):
+            return
+        self._quitting = True
+        self.withdraw()
+        sounds_var = getattr(self, "_sounds_var", None)
+        path = self._sound_paths.get("app quit.wav")
+        if path and (sounds_var is None or sounds_var.get()):
+            def _play_then_exit() -> None:
+                try:
+                    winsound.PlaySound(path, winsound.SND_FILENAME)
+                finally:
+                    self.after(0, self.destroy)
+            threading.Thread(target=_play_then_exit, daemon=True).start()
         else:
             self.destroy()
 
@@ -1256,7 +1788,7 @@ class App(TkinterDnD.Tk):
             pystray.MenuItem("Open", self._tray_open, default=True),
             pystray.MenuItem("Quit", self._tray_quit),
         )
-        return pystray.Icon("Hoarder", img, "Hoarder", menu)
+        return pystray.Icon("Plunder", img, "Plunder", menu)
 
     def _tray_open(self, icon=None, item=None) -> None:
         self.after(0, self._restore_from_tray)
@@ -1265,7 +1797,7 @@ class App(TkinterDnD.Tk):
         if self._tray_icon is not None:
             self._tray_icon.stop()
             self._tray_icon = None
-        self.after(0, self.destroy)
+        self.after(0, self._quit_app)
 
     def _restore_from_tray(self) -> None:
         if self._tray_icon is not None:
@@ -1279,7 +1811,7 @@ class App(TkinterDnD.Tk):
     # Windows startup shortcut
     # ------------------------------------------------------------------
     def _on_startup_toggle(self) -> None:
-        self._play_click()
+        self._play_checkbox()
         try:
             if self._startup_var.get():
                 self._create_startup_shortcut()
@@ -1298,7 +1830,7 @@ class App(TkinterDnD.Tk):
             Path(os.environ["APPDATA"])
             / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
         )
-        return startup / "Hoarder.lnk"
+        return startup / "Plunder.lnk"
 
     @staticmethod
     def _run_bat_path() -> Path:
@@ -1329,6 +1861,8 @@ class App(TkinterDnD.Tk):
 
     def _remove_startup_shortcut(self) -> None:
         self._startup_lnk_path().unlink(missing_ok=True)
+        # Clean up a shortcut left over from before the app was renamed.
+        (self._startup_lnk_path().parent / "Hoarder.lnk").unlink(missing_ok=True)
 
     def _check_stale_startup_shortcut(self) -> None:
         """Recreate startup shortcut if it exists but points to wrong path."""
@@ -1361,7 +1895,7 @@ class App(TkinterDnD.Tk):
     # Folder monitor
     # ------------------------------------------------------------------
     def _on_monitor_toggle(self) -> None:
-        self._play_click()
+        self._play_checkbox()
         folder = self._monitor_folder_var.get()
         if self._monitor_var.get():
             if not folder:
@@ -1383,7 +1917,7 @@ class App(TkinterDnD.Tk):
             self._start_monitor(folder)
 
     def _on_torrent_toggle(self) -> None:
-        self._play_click()
+        self._play_checkbox()
         if self._torrent_var.get():
             self._start_torrent_downloader()
         else:
@@ -1403,13 +1937,13 @@ class App(TkinterDnD.Tk):
             self._move_video_folder_var.set(folder)
 
     def _on_move_music_toggle(self) -> None:
-        self._play_click()
+        self._play_checkbox()
         if self._move_music_var.get() and not self._move_music_folder_var.get():
             self._set_status("Select a folder")
             self._move_music_var.set(False)
 
     def _on_move_video_toggle(self) -> None:
-        self._play_click()
+        self._play_checkbox()
         if self._move_video_var.get() and not self._move_video_folder_var.get():
             self._set_status("Select a folder")
             self._move_video_var.set(False)
@@ -1426,7 +1960,7 @@ class App(TkinterDnD.Tk):
         return port if 1 <= port <= 65535 else None
 
     def _on_proxy_toggle(self) -> None:
-        self._play_click()
+        self._play_checkbox()
         if self._proxy_var.get():
             host = self._proxy_host_var.get().strip()
             port = self._parse_port(self._proxy_port_var.get())
@@ -1455,7 +1989,7 @@ class App(TkinterDnD.Tk):
     # Magnet protocol handler (Windows registry)
     # ------------------------------------------------------------------
     def _on_magnet_handler_toggle(self) -> None:
-        self._play_click()
+        self._play_checkbox()
         try:
             if self._magnet_handler_var.get():
                 self._register_magnet_handler()
@@ -1491,7 +2025,7 @@ class App(TkinterDnD.Tk):
         with winreg.CreateKey(
             winreg.HKEY_CURRENT_USER, r"Software\Classes\Hoarder\Capabilities"
         ) as key:
-            winreg.SetValueEx(key, "ApplicationName", 0, winreg.REG_SZ, "Hoarder")
+            winreg.SetValueEx(key, "ApplicationName", 0, winreg.REG_SZ, "Plunder")
             winreg.SetValueEx(
                 key, "ApplicationDescription", 0, winreg.REG_SZ,
                 "Torrent and media converter",
@@ -1564,6 +2098,223 @@ class App(TkinterDnD.Tk):
             # the whole app down before the window appears.
             return False
 
+    # ------------------------------------------------------------------
+    # Stale handler repair
+    # ------------------------------------------------------------------
+    _MAGNET_CMD_KEY = r"Software\Classes\magnet\shell\open\command"
+
+    @staticmethod
+    def _registered_command(subkey: str) -> Optional[str]:
+        """Read the (default) command string of a shell\\open\\command key."""
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey) as key:
+                val, _ = winreg.QueryValueEx(key, "")
+                return val
+        except OSError:
+            return None
+
+    @staticmethod
+    def _command_target(cmd: Optional[str]) -> Optional[Path]:
+        """The executable a registered shell command launches."""
+        if not cmd:
+            return None
+        cmd = cmd.strip()
+        if cmd.startswith('"'):
+            end = cmd.find('"', 1)
+            return Path(cmd[1:end]) if end > 1 else None
+        head = cmd.split(" ", 1)[0]
+        return Path(head) if head else None
+
+    def _check_stale_handlers(self) -> None:
+        """Re-point the magnet:/.torrent registrations at this build.
+
+        The registered command is a snapshot of sys.executable taken when the
+        checkbox was ticked, and nothing rewrites it afterwards. Rebuilding or
+        installing the app somewhere else therefore leaves Windows launching an
+        exe that no longer exists: Chrome fires the handler, nothing happens,
+        and the checkbox still reads as enabled because it is driven by the
+        URLAssociations key rather than by the command itself.
+
+        A dev run must not steal a working installed registration, so the
+        rewrite only happens when the recorded target is gone, or when this is
+        the frozen build (the installed exe is the one the user launches from
+        the browser).
+        """
+        for registered, cmd_key, current_cmd, reregister in (
+            (
+                self._is_magnet_handler_registered(),
+                self._MAGNET_CMD_KEY,
+                self._magnet_handler_exe_cmd(),
+                self._register_magnet_handler,
+            ),
+            (
+                self._is_torrent_ext_handler_registered(),
+                rf"Software\Classes\{self._TORRENT_PROGID}\shell\open\command",
+                self._torrent_ext_handler_exe_cmd(),
+                self._register_torrent_ext_handler,
+            ),
+        ):
+            if not registered:
+                continue
+            recorded = self._registered_command(cmd_key)
+            if recorded == current_cmd:
+                continue
+            target = self._command_target(recorded)
+            if target is not None and target.exists() and not getattr(sys, "frozen", False):
+                continue
+            try:
+                reregister()
+            except OSError:
+                pass
+
+    # ------------------------------------------------------------------
+    # .torrent file association
+    # ------------------------------------------------------------------
+    _TORRENT_PROGID = "Hoarder.torrentfile"
+
+    @staticmethod
+    def _torrent_ext_handler_exe_cmd() -> str:
+        """Return the command string for opening a .torrent file."""
+        if getattr(sys, "frozen", False):
+            exe = Path(sys.executable)
+            return f'"{exe}" "%1"'
+        exe = Path(sys.executable)
+        script = Path(__file__).parent / "main.py"
+        return f'"{exe}" "{script}" "%1"'
+
+    def _register_torrent_ext_handler(self) -> None:
+        """Make Hoarder the default handler for .torrent files (current user)."""
+        cmd = self._torrent_ext_handler_exe_cmd()
+        with winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER, rf"Software\Classes\{self._TORRENT_PROGID}",
+        ) as key:
+            winreg.SetValueEx(key, "", 0, winreg.REG_SZ, "Torrent File")
+        with winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER,
+            rf"Software\Classes\{self._TORRENT_PROGID}\shell\open\command",
+        ) as key:
+            winreg.SetValueEx(key, "", 0, winreg.REG_SZ, cmd)
+        with winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER, r"Software\Classes\.torrent",
+        ) as key:
+            winreg.SetValueEx(key, "", 0, winreg.REG_SZ, self._TORRENT_PROGID)
+
+    def _unregister_torrent_ext_handler(self) -> None:
+        """Remove Hoarder as the .torrent file handler."""
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, r"Software\Classes\.torrent",
+                0, winreg.KEY_ALL_ACCESS,
+            ) as key:
+                val, _ = winreg.QueryValueEx(key, "")
+                if val == self._TORRENT_PROGID:
+                    winreg.DeleteValue(key, "")
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        for subkey in [
+            rf"Software\Classes\{self._TORRENT_PROGID}\shell\open\command",
+            rf"Software\Classes\{self._TORRENT_PROGID}\shell\open",
+            rf"Software\Classes\{self._TORRENT_PROGID}\shell",
+            rf"Software\Classes\{self._TORRENT_PROGID}",
+        ]:
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, subkey)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+    @classmethod
+    def _is_torrent_ext_handler_registered(cls) -> bool:
+        """Check if Hoarder is currently the default .torrent handler."""
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, r"Software\Classes\.torrent",
+            ) as key:
+                val, _ = winreg.QueryValueEx(key, "")
+                return val == cls._TORRENT_PROGID
+        except OSError:
+            return False
+
+    def _on_torrent_ext_handler_toggle(self) -> None:
+        self._play_checkbox()
+        try:
+            if self._torrent_ext_var.get():
+                self._register_torrent_ext_handler()
+            else:
+                self._unregister_torrent_ext_handler()
+        except OSError as e:
+            self._set_status(f"Association error: {e}")
+            self._torrent_ext_var.set(not self._torrent_ext_var.get())
+        self._torrent_ext_asked = True
+        self._save_settings()
+
+    def _maybe_prompt_torrent_association(self) -> None:
+        """Ask once, on first startup, to associate .torrent files with
+        Hoarder — unless already asked, or already associated."""
+        if self._torrent_ext_asked or self._is_torrent_ext_handler_registered():
+            return
+        self._show_torrent_association_prompt()
+
+    def _show_torrent_association_prompt(self) -> None:
+        """A small popup locked to a fixed spot inside the app window: it
+        has no title bar to drag by, follows the window if it's moved, and
+        only ever closes via its own Yes/No buttons."""
+        popup = tk.Toplevel(self, bg=LIGHT, highlightbackground=DARK, highlightthickness=BORDER)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        popup.transient(self)
+
+        def _reposition(_event=None) -> None:
+            popup.update_idletasks()
+            x = self.winfo_rootx() + (self.winfo_width() - popup.winfo_reqwidth()) // 2
+            y = self.winfo_rooty() + (self.winfo_height() - popup.winfo_reqheight()) // 2
+            popup.geometry(f"+{x}+{y}")
+
+        follow_id = self.bind("<Configure>", _reposition, add="+")
+
+        def _answer(associate: bool) -> None:
+            self.unbind("<Configure>", follow_id)
+            self._torrent_ext_asked = True
+            if associate:
+                try:
+                    self._register_torrent_ext_handler()
+                    self._torrent_ext_var.set(True)
+                except OSError as e:
+                    self._set_status(f"Association error: {e}")
+            self._save_settings()
+            popup.grab_release()
+            popup.destroy()
+
+        pad = 12 * SCALE
+        tk.Label(
+            popup, text="Open .torrent files with Plunder?",
+            bg=LIGHT, fg=DARK, font=("Silkscreen", 12 * SCALE),
+            justify="left", wraplength=220 * SCALE,
+        ).pack(padx=pad, pady=(pad, 6 * SCALE))
+
+        btn_row = tk.Frame(popup, bg=LIGHT)
+        btn_row.pack(padx=pad, pady=(0, pad), fill="x")
+        for text, associate in (("Yes", True), ("No", False)):
+            tk.Button(
+                btn_row, text=text, bg=DARK, fg=LIGHT,
+                activebackground=DARK, activeforeground=LIGHT,
+                font=("Silkscreen", 11 * SCALE), relief="flat",
+                borderwidth=0, padx=10 * SCALE, pady=4 * SCALE,
+                command=lambda a=associate: _answer(a),
+            ).pack(side="left", expand=True, padx=4 * SCALE)
+
+        _reposition()
+        # Modal grab: must happen after the popup is actually mapped/shown
+        # with real content and geometry — grabbing an unviewable window is
+        # unreliable and can leave it never actually appearing on screen.
+        popup.deiconify()
+        popup.lift()
+        popup.focus_force()
+        popup.grab_set()
+
     def _handle_magnet_link(self, magnet_uri: str) -> None:
         """Handle a magnet URI passed via command line or browser."""
         if not self._torrent_var.get():
@@ -1572,6 +2323,11 @@ class App(TkinterDnD.Tk):
         if self._torrent_downloader:
             self._torrent_downloader.add(magnet_uri)
             self._set_status("Added magnet link")
+        else:
+            # The downloader needs a running folder monitor to stage into, so
+            # a magnet handed over by the browser can arrive with nowhere to
+            # go. Say so plainly instead of dropping it in silence.
+            self._set_status("Magnet dropped — enable Monitor folder", WARM)
 
     def _start_torrent_downloader(self) -> None:
         """Start downloading torrents into a staging area inside the monitored
@@ -1638,6 +2394,7 @@ class App(TkinterDnD.Tk):
         self._torrent_progress_widgets[tid]["bar"].set(progress)
 
     def _add_torrent_progress_row(self, tid: str, name: str) -> None:
+        self._play_torrent_added()
         frame = tk.Frame(self._torrent_progress_frame, bg=DARK)
         frame.pack(fill="x", padx=2 * SCALE, pady=1 * SCALE)
         short_name = format_torrent_name(name)
@@ -1673,6 +2430,7 @@ class App(TkinterDnD.Tk):
         torrents need one explicit nudge; single files are picked up
         naturally once they land.
         """
+        self._play_torrent_downloaded()
         self._remove_torrent_progress(tid)
         monitor_folder = self._monitor_folder_var.get()
         if not monitor_folder:

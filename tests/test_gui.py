@@ -540,6 +540,9 @@ class _TorrentCompleteHost:
         self.enqueued = []
         self.errors = []
 
+    def _play_torrent_downloaded(self):
+        pass
+
     def _enqueue_conversion(self, paths):
         self.enqueued.append(paths)
 
@@ -937,6 +940,8 @@ class _SaveSettingsHost:
         self._proxy_port_var = _var("")
         self._proxy_username_var = _var("")
         self._proxy_password_var = _var("")
+        self._torrent_ext_asked = False
+        self._sound_volume = 100
 
 
 def test_save_settings_writes_every_default_key(monkeypatch):
@@ -948,6 +953,217 @@ def test_save_settings_writes_every_default_key(monkeypatch):
     host._save_settings()
 
     assert set(captured.keys()) == set(smod._DEFAULTS.keys())
+
+
+# --- .torrent file association prompt/toggle ---
+#
+# The registry-touching methods themselves (_register_torrent_ext_handler
+# etc.) aren't unit tested here, matching this codebase's existing choice
+# not to test the analogous magnet-handler registry calls — both mutate
+# real HKEY_CURRENT_USER state, which isn't something to do from a test
+# run. What's covered instead is the decision logic around them: whether
+# the toggle rolls back the checkbox on failure, and whether the startup
+# prompt correctly skips when it's already been asked or already set up.
+
+class _MutableVar:
+    def __init__(self, value):
+        self._value = value
+
+    def get(self):
+        return self._value
+
+    def set(self, value):
+        self._value = value
+
+
+class _TorrentAssocHost:
+    _on_torrent_ext_handler_toggle = _App._on_torrent_ext_handler_toggle
+    _maybe_prompt_torrent_association = _App._maybe_prompt_torrent_association
+
+    def __init__(self, register_raises=None, already_registered=False):
+        self._torrent_ext_var = _MutableVar(False)
+        self._torrent_ext_asked = False
+        self._sound_volume = 100
+        self._register_raises = register_raises
+        self._already_registered = already_registered
+        self.status_calls = []
+        self.save_calls = 0
+        self.register_calls = 0
+        self.unregister_calls = 0
+        self.prompt_shown = False
+
+    def _play_checkbox(self):
+        pass
+
+    def _set_status(self, text, color=None):
+        self.status_calls.append(text)
+
+    def _save_settings(self):
+        self.save_calls += 1
+
+    def _register_torrent_ext_handler(self):
+        self.register_calls += 1
+        if self._register_raises:
+            raise self._register_raises
+
+    def _unregister_torrent_ext_handler(self):
+        self.unregister_calls += 1
+
+    def _is_torrent_ext_handler_registered(self):
+        return self._already_registered
+
+    def _show_torrent_association_prompt(self):
+        self.prompt_shown = True
+
+
+def test_torrent_ext_toggle_on_registers_and_marks_asked():
+    host = _TorrentAssocHost()
+    host._torrent_ext_var.set(True)
+    host._on_torrent_ext_handler_toggle()
+    assert host.register_calls == 1
+    assert host.unregister_calls == 0
+    assert host._torrent_ext_asked is True
+    assert host.save_calls == 1
+
+
+def test_torrent_ext_toggle_off_unregisters():
+    host = _TorrentAssocHost()
+    host._torrent_ext_var.set(False)
+    host._on_torrent_ext_handler_toggle()
+    assert host.unregister_calls == 1
+    assert host.register_calls == 0
+
+
+def test_torrent_ext_toggle_register_error_reverts_checkbox():
+    host = _TorrentAssocHost(register_raises=OSError("permission denied"))
+    host._torrent_ext_var.set(True)
+    host._on_torrent_ext_handler_toggle()
+    assert host._torrent_ext_var.get() is False
+    assert any("error" in msg.lower() for msg in host.status_calls)
+    # Still marked asked/saved — a failed attempt shouldn't nag again.
+    assert host._torrent_ext_asked is True
+
+
+def test_maybe_prompt_skips_if_already_asked():
+    host = _TorrentAssocHost(already_registered=False)
+    host._torrent_ext_asked = True
+    host._maybe_prompt_torrent_association()
+    assert host.prompt_shown is False
+
+
+def test_maybe_prompt_skips_if_already_registered():
+    host = _TorrentAssocHost(already_registered=True)
+    host._torrent_ext_asked = False
+    host._maybe_prompt_torrent_association()
+    assert host.prompt_shown is False
+
+
+import sys
+
+# --- stale magnet/.torrent handler repair ---
+#
+# Same split as above: the registry writes stay untested, the decision of
+# *whether* to rewrite is what's covered. The host stubs the two registry
+# reads (_registered_command, _is_*_registered) so no HKCU state is touched.
+
+def test_command_target_parses_quoted_exe():
+    cmd = '"C:\\Program Files\\Plunder\\Plunder.exe" --magnet "%1"'
+    assert _App._command_target(cmd) == Path("C:\\Program Files\\Plunder\\Plunder.exe")
+
+
+def test_command_target_parses_unquoted_exe():
+    assert _App._command_target('C:\\tools\\p.exe --magnet "%1"') == Path("C:\\tools\\p.exe")
+
+
+def test_command_target_handles_missing_command():
+    assert _App._command_target(None) is None
+    assert _App._command_target("") is None
+
+
+class _StaleHandlerHost:
+    _check_stale_handlers = _App._check_stale_handlers
+    _command_target = staticmethod(_App._command_target)
+    _MAGNET_CMD_KEY = _App._MAGNET_CMD_KEY
+    _TORRENT_PROGID = _App._TORRENT_PROGID
+
+    def __init__(self, recorded, current, registered=True):
+        self._recorded = recorded
+        self._current = current
+        self._registered = registered
+        self.magnet_registrations = 0
+        self.torrent_registrations = 0
+
+    def _registered_command(self, subkey):
+        return self._recorded
+
+    def _is_magnet_handler_registered(self):
+        return self._registered
+
+    def _is_torrent_ext_handler_registered(self):
+        return False
+
+    def _magnet_handler_exe_cmd(self):
+        return self._current
+
+    def _torrent_ext_handler_exe_cmd(self):
+        return self._current
+
+    def _register_magnet_handler(self):
+        self.magnet_registrations += 1
+
+    def _register_torrent_ext_handler(self):
+        self.torrent_registrations += 1
+
+
+_GONE = '"C:\\nope\\gone\\Hoarder.exe" --magnet "%1"'
+_HERE = '"C:\\Program Files\\Plunder\\Plunder.exe" --magnet "%1"'
+
+
+def test_stale_handler_rewritten_when_recorded_exe_is_gone():
+    host = _StaleHandlerHost(recorded=_GONE, current=_HERE)
+    host._check_stale_handlers()
+    assert host.magnet_registrations == 1
+
+
+def test_matching_handler_is_left_alone():
+    host = _StaleHandlerHost(recorded=_HERE, current=_HERE)
+    host._check_stale_handlers()
+    assert host.magnet_registrations == 0
+
+
+def test_unregistered_handler_is_not_resurrected():
+    host = _StaleHandlerHost(recorded=_GONE, current=_HERE, registered=False)
+    host._check_stale_handlers()
+    assert host.magnet_registrations == 0
+
+
+def test_dev_run_does_not_steal_a_working_registration(monkeypatch, tmp_path):
+    """A live installed exe keeps the association when python main.py runs."""
+    installed = tmp_path / "Plunder.exe"
+    installed.write_text("")
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    host = _StaleHandlerHost(
+        recorded=f'"{installed}" --magnet "%1"',
+        current='"C:\\Python\\python.exe" "main.py" --magnet "%1"',
+    )
+    host._check_stale_handlers()
+    assert host.magnet_registrations == 0
+
+
+def test_frozen_build_reclaims_a_live_but_different_registration(monkeypatch, tmp_path):
+    other = tmp_path / "OldBuild.exe"
+    other.write_text("")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    host = _StaleHandlerHost(recorded=f'"{other}" --magnet "%1"', current=_HERE)
+    host._check_stale_handlers()
+    assert host.magnet_registrations == 1
+
+
+def test_maybe_prompt_shows_when_neither_asked_nor_registered():
+    host = _TorrentAssocHost(already_registered=False)
+    host._torrent_ext_asked = False
+    host._maybe_prompt_torrent_association()
+    assert host.prompt_shown is True
 
 
 # --- progress bar geometry ---

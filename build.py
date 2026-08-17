@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Build Hoarder as a single portable executable.
+"""Build Plunder as a single portable executable.
 
 Usage:
     py build.py
 
 Output:
-    dist/Hoarder.exe       <- copy this one file anywhere, it runs standalone
+    dist/Plunder.exe       <- copy this one file anywhere, it runs standalone
 
 Notes:
     - ffmpeg.exe and ffprobe.exe are NOT bundled (they're ~96 MB each) — the
       app downloads a static build on first use and caches it in
       %LOCALAPPDATA%\Hoarder\bin (see ffmpeg_fetch.py). aria2c.exe is small
       enough to keep bundling directly.
-    - settings.json/library.json are written next to Hoarder.exe (via
+    - settings.json/library.json are written next to Plunder.exe (via
       sys.executable, not the onefile temp-extraction dir) so they persist
       and travel with the exe wherever it's copied.
     - --onefile means every launch self-extracts to a temp dir first, so
@@ -39,19 +39,20 @@ def _pre_build_clean(dist_exe: Path) -> None:
     """Prepare a clean output location before PyInstaller runs.
 
     Strategy:
-    1. Kill any running Hoarder.exe (it locks dist/Hoarder.exe while running).
-    2. Try to delete dist/Hoarder.exe outright (works if nothing is locked).
+    1. Kill any running Plunder.exe (it locks dist/Plunder.exe while running).
+    2. Try to delete dist/Plunder.exe outright (works if nothing is locked).
     3. If that fails, RENAME it aside — Windows allows renaming a locked
        file, which unblocks the build path so PyInstaller can create a
        fresh one.
     4. Best-effort delete the renamed-aside old exe after the build.
     """
-    result = subprocess.run(
-        ["taskkill", "/F", "/IM", "Hoarder.exe"],
-        capture_output=True, text=True,
-    )
-    if result.returncode == 0:
-        print("Terminated Hoarder.exe.")
+    for proc in ("Plunder.exe", "Hoarder.exe"):
+        result = subprocess.run(
+            ["taskkill", "/F", "/IM", proc],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            print(f"Terminated {proc}.")
 
     if not dist_exe.exists():
         return
@@ -77,7 +78,7 @@ def _pre_build_clean(dist_exe: Path) -> None:
 
 def main() -> None:
     # ------------------------------------------------------------------ deps
-    _pre_build_clean(HERE / "dist" / "Hoarder.exe")
+    _pre_build_clean(HERE / "dist" / "Plunder.exe")
     try:
         import PyInstaller  # noqa: F401
     except ImportError:
@@ -95,7 +96,10 @@ def main() -> None:
     S = ";"
     datas = [
         f"{HERE / 'slkscr.ttf'}{S}.",
+        f"{HERE / 'Alkhemikal.ttf'}{S}.",
         f"{HERE / 'hoarder.ico'}{S}.",
+        f"{HERE / 'skull.png'}{S}.",
+        f"{HERE / 'chain.png'}{S}.",
         f"{tnd_dir}{S}tkinterdnd2",
         f"{ctk_dir}{S}customtkinter",
     ]
@@ -113,7 +117,7 @@ def main() -> None:
         sys.executable, "-m", "PyInstaller",
         "--onefile",                       # single portable exe
         "--windowed",                      # no console window
-        "--name", "Hoarder",
+        "--name", "Plunder",
         "--icon", str(HERE / "hoarder.ico"),
         "--noconfirm",
         "--clean",
@@ -136,11 +140,11 @@ def main() -> None:
     run(cmd)
 
     # Best-effort cleanup of the renamed-aside old exe (from _pre_build_clean)
-    old_exe = HERE / "dist" / "Hoarder_old.exe"
+    old_exe = HERE / "dist" / "Plunder_old.exe"
     if old_exe.exists():
         try:
             old_exe.unlink()
-            print("Removed dist/Hoarder_old.exe.")
+            print("Removed dist/Plunder_old.exe.")
         except OSError:
             pass
 
@@ -150,7 +154,7 @@ def main() -> None:
         shutil.rmtree(build_dir)
         print("Removed intermediate build/ directory.")
 
-    out = HERE / "dist" / "Hoarder.exe"
+    out = HERE / "dist" / "Plunder.exe"
     print()
     print("Build complete.")
     print(f"  Portable exe : {out}")

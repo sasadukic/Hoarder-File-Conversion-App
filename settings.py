@@ -20,6 +20,7 @@ _DEFAULTS: Dict[str, Any] = {
     "minimize_to_tray": False,
     "start_on_startup": False,
     "sounds_enabled": True,
+    "sound_volume": 100,
     "monitor_enabled": False,
     "monitor_folder": None,
     "torrent_enabled": False,
@@ -33,6 +34,7 @@ _DEFAULTS: Dict[str, Any] = {
     "proxy_port": None,
     "proxy_username": None,
     "proxy_password": None,
+    "torrent_ext_association_asked": False,
 }
 
 

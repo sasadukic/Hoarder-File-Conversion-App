@@ -39,6 +39,16 @@ def _parse_magnet_arg() -> str | None:
     return None
 
 
+def _parse_torrent_file_arg() -> str | None:
+    """A .torrent file path passed on the command line — e.g. Windows
+    launching Hoarder.exe "%1" after a double-click, once .torrent files
+    are associated with it."""
+    for arg in sys.argv[1:]:
+        if arg.lower().endswith(".torrent") and Path(arg).is_file():
+            return arg
+    return None
+
+
 def _start_pipe_server(app: App) -> None:
     """Listen on a named pipe for magnet URIs from other Hoarder instances."""
     def _server():
@@ -58,7 +68,11 @@ def _start_pipe_server(app: App) -> None:
                 kernel32.ReadFile(h, buf, _BUFSIZE, ctypes.byref(read), None)
                 kernel32.CloseHandle(h)
                 uri = buf.value.decode("utf-8", errors="replace").rstrip("\x00")
-                if uri.startswith("magnet:?"):
+                # .torrent paths travel the same pipe as magnet URIs — the
+                # downloader takes either, and dropping the file paths here
+                # would make a double-click on a .torrent do nothing while
+                # Hoarder is already running.
+                if uri.startswith("magnet:?") or uri.lower().endswith(".torrent"):
                     app.after(0, app._handle_magnet_link, uri)
             else:
                 kernel32.CloseHandle(h)
@@ -94,18 +108,21 @@ def _register_font(ttf_path: Path) -> None:
 if __name__ == "__main__":
     _bundle_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
     _register_font(_bundle_dir / "slkscr.ttf")
+    _register_font(_bundle_dir / "Alkhemikal.ttf")
     start_in_tray = "--tray" in sys.argv
 
     magnet_uri = _parse_magnet_arg()
+    torrent_file = _parse_torrent_file_arg()
+    link_arg = magnet_uri or torrent_file
 
-    # If another instance is running, send it the magnet and exit
-    if _try_send_to_existing(magnet_uri):
+    # If another instance is running, send it the link/file and exit
+    if _try_send_to_existing(link_arg):
         sys.exit(0)
 
     app = App(start_in_tray=start_in_tray)
     _start_pipe_server(app)
 
-    if magnet_uri:
-        app.after(100, app._handle_magnet_link, magnet_uri)
+    if link_arg:
+        app.after(100, app._handle_magnet_link, link_arg)
 
     app.mainloop()
