@@ -410,6 +410,7 @@ class App(TkinterDnD.Tk):
 
         self._settings = smod.load()
         self._monitor: mmod.FolderMonitor | None = None
+        self._staging_sweep_after_id: Optional[str] = None
         self._hiding_to_tray = False
         self._tray_icon = None
         self._is_converting = False
@@ -2786,12 +2787,13 @@ class App(TkinterDnD.Tk):
             self._monitor.start()
             self._recover_staged_downloads(folder)
             self._scan_existing_files(folder)
+            self._schedule_staging_sweep()
         except Exception as e:
             self._set_status(f"Monitor error: {e}")
             self._monitor_var.set(False)
             self._monitor = None
 
-    def _recover_staged_downloads(self, monitor_folder: str) -> None:
+    def _recover_staged_downloads(self, monitor_folder: str) -> int:
         """Move complete-looking downloads left behind in torrent staging
         into the real monitored folder, so they don't sit stuck forever.
 
@@ -2817,7 +2819,7 @@ class App(TkinterDnD.Tk):
         """
         staging = Path(monitor_folder) / STAGING_DIRNAME
         if not staging.is_dir():
-            return
+            return 0
         unfinished = self._unfinished_download_names()
         recovered = 0
         for entry in list(staging.iterdir()):
@@ -2838,6 +2840,29 @@ class App(TkinterDnD.Tk):
         if recovered:
             plural = "s" if recovered != 1 else ""
             self._set_info(f"Recovered {recovered} interrupted download{plural}", SAGE)
+        return recovered
+
+    # How often the monitor re-checks staging for downloads whose completion
+    # was never acted on — e.g. on_complete firing while a widget it touches
+    # no longer exists, or any other one-off failure in that handoff. Startup
+    # recovery alone only runs once per launch; a torrent that finishes and
+    # gets stuck hours into a long-running session would otherwise sit there
+    # until the app is restarted.
+    _STAGING_SWEEP_MS = 90_000
+
+    def _schedule_staging_sweep(self) -> None:
+        self._staging_sweep_after_id = self.after(
+            self._STAGING_SWEEP_MS, self._sweep_stuck_staging
+        )
+
+    def _sweep_stuck_staging(self) -> None:
+        folder = self._monitor_folder_var.get()
+        if self._monitor is None or not folder:
+            self._staging_sweep_after_id = None
+            return
+        if self._recover_staged_downloads(folder):
+            self._scan_existing_files(folder)
+        self._schedule_staging_sweep()
 
     @staticmethod
     def _unfinished_download_names() -> set:
@@ -3037,6 +3062,9 @@ class App(TkinterDnD.Tk):
             self._start_conversion()
 
     def _stop_monitor(self) -> None:
+        if self._staging_sweep_after_id is not None:
+            self.after_cancel(self._staging_sweep_after_id)
+            self._staging_sweep_after_id = None
         if self._monitor is not None:
             self._monitor.stop()
             self._monitor = None

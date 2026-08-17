@@ -961,6 +961,97 @@ def test_recover_reports_combined_count(tmp_path):
     assert host.infos == ["Recovered 2 interrupted downloads"]
 
 
+def test_recover_returns_the_number_moved(tmp_path):
+    """The periodic sweep needs this to decide whether a rescan is worth it."""
+    monitor = tmp_path / "monitor"
+    staging = monitor / ".hoarder-incoming"
+    staging.mkdir(parents=True)
+    (staging / "a.mkv").write_bytes(b"one")
+    (staging / "b.flac").write_bytes(b"two")
+
+    host = _RecoveryHost()
+    assert host._recover_staged_downloads(str(monitor)) == 2
+
+
+def test_recover_returns_zero_when_nothing_is_ready(tmp_path):
+    monitor = tmp_path / "monitor"
+    staging = monitor / ".hoarder-incoming"
+    staging.mkdir(parents=True)
+    (staging / "a.mkv").write_bytes(b"partial")
+    (staging / "a.mkv.aria2").write_bytes(b"still going")
+
+    host = _RecoveryHost()
+    assert host._recover_staged_downloads(str(monitor)) == 0
+
+
+# --- periodic staging sweep (a completion that never fired on_complete —
+# e.g. because of an error mid-callback — used to sit stuck until the app
+# was restarted; now the monitor rechecks staging on a timer) ---
+
+class _SweepHost:
+    _schedule_staging_sweep = _App._schedule_staging_sweep
+    _sweep_stuck_staging = _App._sweep_stuck_staging
+    _STAGING_SWEEP_MS = _App._STAGING_SWEEP_MS
+
+    def __init__(self, folder="/monitor", monitor_running=True, recovered=0):
+        self._monitor_folder_var = _MutableVar(folder)
+        self._monitor = object() if monitor_running else None
+        self._staging_sweep_after_id = None
+        self._recovered = recovered
+        self.recover_calls = []
+        self.scan_calls = []
+        self.after_calls = []
+
+    def after(self, ms, fn):
+        self.after_calls.append((ms, fn))
+        return f"id-{len(self.after_calls)}"
+
+    def _recover_staged_downloads(self, folder):
+        self.recover_calls.append(folder)
+        return self._recovered
+
+    def _scan_existing_files(self, folder):
+        self.scan_calls.append(folder)
+
+
+def test_schedule_staging_sweep_books_a_timer():
+    host = _SweepHost()
+    host._schedule_staging_sweep()
+    assert host.after_calls == [(host._STAGING_SWEEP_MS, host._sweep_stuck_staging)]
+    assert host._staging_sweep_after_id == "id-1"
+
+
+def test_sweep_rescans_when_something_was_stuck_in_staging():
+    host = _SweepHost(recovered=1)
+    host._sweep_stuck_staging()
+    assert host.recover_calls == ["/monitor"]
+    assert host.scan_calls == ["/monitor"]
+    assert len(host.after_calls) == 1  # reschedules itself
+
+
+def test_sweep_does_not_rescan_the_library_when_staging_was_already_clear():
+    host = _SweepHost(recovered=0)
+    host._sweep_stuck_staging()
+    assert host.recover_calls == ["/monitor"]
+    assert host.scan_calls == []
+    assert len(host.after_calls) == 1  # still reschedules — the next check
+
+
+def test_sweep_stops_once_the_monitor_has_been_turned_off():
+    host = _SweepHost(monitor_running=False)
+    host._sweep_stuck_staging()
+    assert host.recover_calls == []
+    assert host.after_calls == []
+    assert host._staging_sweep_after_id is None
+
+
+def test_sweep_stops_once_the_monitor_folder_is_cleared():
+    host = _SweepHost(folder="")
+    host._sweep_stuck_staging()
+    assert host.recover_calls == []
+    assert host.after_calls == []
+
+
 # --- _parse_port ---
 
 def test_parse_port_valid():
