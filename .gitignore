@@ -10,3 +10,4 @@ build/
 nul
 .worktrees/
 library.json
+session.json

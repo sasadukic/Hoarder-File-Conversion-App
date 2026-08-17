@@ -12,6 +12,13 @@ from torrent_downloader import (
     _LOCAL_ARIA2C,
     _NO_WINDOW,
     check_proxy_reachable,
+    clamp_max_active,
+    DEFAULT_MAX_ACTIVE,
+    PROGRESS_QUEUED,
+    CONTROL_SAVE_INTERVAL,
+    control_file_for,
+    has_incomplete_download,
+    sweep_stale_staged_torrents,
 )
 
 
@@ -736,6 +743,333 @@ def test_torrent_info_name_none_for_malformed_file(tmp_path):
 
 def test_torrent_info_name_none_for_missing_file(tmp_path):
     assert _torrent_info_name(str(tmp_path / "gone.torrent")) is None
+
+
+# --- concurrency limit ---
+
+def test_clamp_max_active_bounds_and_defaults():
+    assert clamp_max_active(1) == 1
+    assert clamp_max_active(20) == 20
+    assert clamp_max_active(0) == 1        # below the floor
+    assert clamp_max_active(999) == 20     # above the ceiling
+    assert clamp_max_active(None) == DEFAULT_MAX_ACTIVE
+    assert clamp_max_active("nonsense") == DEFAULT_MAX_ACTIVE
+    assert clamp_max_active("7") == 7      # settings.json can hold a string
+
+
+class _Concurrency:
+    """aria2c downloads that never finish on their own, so the only thing
+    that frees a slot is the test asking for one."""
+
+    def __init__(self, tmp_path, max_active):
+        self.progress = []
+        self.popen = patch(
+            "torrent_downloader.subprocess.Popen", return_value=MagicMock(),
+        )
+        self.find = patch("torrent_downloader._find_aria2c", return_value="/fake/aria2c")
+        self.monitor = patch.object(TorrentDownloader, "_spawn_aria2c_monitor")
+        self.tmp_path = tmp_path
+        self.max_active = max_active
+
+    def __enter__(self):
+        self.find.start()
+        self.mock_popen = self.popen.start()
+        self.monitor.start()
+        self.td = TorrentDownloader(
+            str(self.tmp_path),
+            lambda t, n, p: self.progress.append((t, n, p)),
+            lambda t, p: None,
+            max_active=self.max_active,
+        )
+        self.td.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.td.stop()
+        self.monitor.stop()
+        self.popen.stop()
+        self.find.stop()
+
+    def add(self, i):
+        return self.td.add(f"magnet:?xt=urn:btih:{i}&dn=T{i}")
+
+    @property
+    def started(self):
+        return self.mock_popen.call_count
+
+    @property
+    def queued(self):
+        return [t for t, _n, p in self.progress if p == PROGRESS_QUEUED]
+
+
+def test_only_max_active_torrents_start_at_once(tmp_path):
+    with _Concurrency(tmp_path, max_active=2) as c:
+        tids = [c.add(i) for i in range(5)]
+        assert all(t is not None for t in tids)   # all accepted…
+        assert c.started == 2                     # …but only two transferring
+        assert c.queued == tids[2:]
+
+
+def test_finishing_one_starts_the_next_in_line(tmp_path):
+    with _Concurrency(tmp_path, max_active=2) as c:
+        tids = [c.add(i) for i in range(4)]
+        assert c.started == 2
+        c.td.remove(tids[0])
+        assert c.started == 3
+        c.td.remove(tids[1])
+        assert c.started == 4
+
+
+def test_raising_the_limit_starts_waiting_torrents(tmp_path):
+    with _Concurrency(tmp_path, max_active=1) as c:
+        for i in range(4):
+            c.add(i)
+        assert c.started == 1
+        c.td.set_max_active(4)
+        assert c.started == 4
+
+
+def test_lowering_the_limit_leaves_running_transfers_alone(tmp_path):
+    """Killing a download to satisfy a smaller limit would throw away work —
+    the new limit applies to what starts next."""
+    with _Concurrency(tmp_path, max_active=4) as c:
+        for i in range(4):
+            c.add(i)
+        assert c.started == 4
+        c.td.set_max_active(1)
+        assert c.started == 4
+        assert len(c.td._aria2c_procs) == 4
+
+
+def test_a_waiting_torrent_can_be_removed_before_it_starts(tmp_path):
+    with _Concurrency(tmp_path, max_active=1) as c:
+        first, second, third = (c.add(i) for i in range(3))
+        c.td.remove(third)          # still waiting: nothing to terminate
+        c.td.remove(first)          # frees the only slot
+        assert c.started == 2       # second promoted, third gone for good
+
+
+def test_snapshot_covers_running_and_waiting_torrents(tmp_path):
+    with _Concurrency(tmp_path, max_active=1) as c:
+        running = c.add(0)
+        waiting = c.add(1)
+        snap = c.td.snapshot()
+        by_tid = {s["tid"]: s for s in snap}
+        assert set(by_tid) == {running, waiting}
+        assert by_tid[running]["target"] == "magnet:?xt=urn:btih:0&dn=T0"
+        assert by_tid[waiting]["target"] == "magnet:?xt=urn:btih:1&dn=T1"
+        assert by_tid[waiting]["name"] == "T1"
+
+
+def test_snapshot_points_at_the_staged_copy_for_torrent_files(tmp_path):
+    """The user's own .torrent may be deleted right after adding, so the
+    resume target has to be the copy the downloader made."""
+    torrent_file = tmp_path / "movie.torrent"
+    torrent_file.write_bytes(b"d4:infod4:name5:Movieee")
+
+    with patch("torrent_downloader._find_aria2c", return_value="/fake/aria2c"):
+        with patch("torrent_downloader.subprocess.Popen", return_value=MagicMock()):
+            with patch.object(TorrentDownloader, "_spawn_aria2c_monitor"):
+                td = TorrentDownloader(str(tmp_path), lambda t, n, p: None, lambda t, p: None)
+                td.start()
+                tid = td.add(str(torrent_file))
+                target = td.snapshot()[0]["target"]
+                assert target != str(torrent_file)
+                assert Path(target).name == "movie.torrent"
+                torrent_file.unlink()
+                assert Path(target).is_file()   # the resume source survives
+                td.stop()
+
+
+def test_snapshot_is_empty_once_nothing_is_left(tmp_path):
+    with _Concurrency(tmp_path, max_active=2) as c:
+        tid = c.add(0)
+        c.td.remove(tid)
+        assert c.td.snapshot() == []
+
+
+def test_aria2c_is_told_to_continue_an_interrupted_transfer(tmp_path):
+    magnet_file = tmp_path / "test.magnet"
+    magnet_file.write_text("magnet:?xt=urn:btih:123&dn=Test", encoding="utf-8")
+    mock_proc = MagicMock()
+    mock_proc.stdout = iter([])
+    mock_proc.wait.return_value = 0
+
+    with patch("torrent_downloader._find_aria2c", return_value="/fake/aria2c"):
+        with patch("torrent_downloader.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            td = TorrentDownloader(str(tmp_path), lambda t, n, p: None, lambda t, p: None)
+            td.start()
+            td.add(str(magnet_file))
+            assert "--continue=true" in mock_popen.call_args[0][0]
+            td.stop()
+
+
+def test_aria2c_saves_its_control_file_often(tmp_path):
+    """Closing Plunder kills aria2c outright, so a resume only gets what the
+    last save wrote. aria2c's own 60s default would throw away a minute of
+    transfer — and leave a just-started torrent with no control file at all."""
+    magnet_file = tmp_path / "test.magnet"
+    magnet_file.write_text("magnet:?xt=urn:btih:123&dn=Test", encoding="utf-8")
+    mock_proc = MagicMock()
+    mock_proc.stdout = iter([])
+    mock_proc.wait.return_value = 0
+
+    with patch("torrent_downloader._find_aria2c", return_value="/fake/aria2c"):
+        with patch("torrent_downloader.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            td = TorrentDownloader(str(tmp_path), lambda t, n, p: None, lambda t, p: None)
+            td.start()
+            td.add(str(magnet_file))
+            cmd = mock_popen.call_args[0][0]
+            assert f"--auto-save-interval={CONTROL_SAVE_INTERVAL}" in cmd
+            assert CONTROL_SAVE_INTERVAL < 60
+            td.stop()
+
+
+def test_a_resume_asks_aria2c_to_hash_check_what_is_already_there(tmp_path):
+    magnet_file = tmp_path / "test.magnet"
+    magnet_file.write_text("magnet:?xt=urn:btih:123&dn=Test", encoding="utf-8")
+    mock_proc = MagicMock()
+    mock_proc.stdout = iter([])
+    mock_proc.wait.return_value = 0
+
+    with patch("torrent_downloader._find_aria2c", return_value="/fake/aria2c"):
+        with patch("torrent_downloader.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            td = TorrentDownloader(str(tmp_path), lambda t, n, p: None, lambda t, p: None)
+            td.start()
+            td.add(str(magnet_file), resume=True)
+            assert "--check-integrity=true" in mock_popen.call_args[0][0]
+            td.stop()
+
+
+def test_a_fresh_add_does_not_pay_for_a_hash_check(tmp_path):
+    magnet_file = tmp_path / "test.magnet"
+    magnet_file.write_text("magnet:?xt=urn:btih:123&dn=Test", encoding="utf-8")
+    mock_proc = MagicMock()
+    mock_proc.stdout = iter([])
+    mock_proc.wait.return_value = 0
+
+    with patch("torrent_downloader._find_aria2c", return_value="/fake/aria2c"):
+        with patch("torrent_downloader.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            td = TorrentDownloader(str(tmp_path), lambda t, n, p: None, lambda t, p: None)
+            td.start()
+            td.add(str(magnet_file))
+            assert "--check-integrity=true" not in mock_popen.call_args[0][0]
+            td.stop()
+
+
+def test_a_queued_torrent_keeps_its_resume_flag_until_it_starts(tmp_path):
+    """A resume that waits its turn behind the concurrency limit must still be
+    a resume when a slot finally frees up."""
+    magnet_file = tmp_path / "test.magnet"
+    magnet_file.write_text("magnet:?xt=urn:btih:123&dn=Test", encoding="utf-8")
+    spawned = []
+
+    def _make_proc(cmd, *a, **k):
+        p = MagicMock()
+        p.stdout = iter([])
+        p.wait.return_value = 0
+        spawned.append(cmd)
+        return p
+
+    with patch("torrent_downloader._find_aria2c", return_value="/fake/aria2c"):
+        with patch("torrent_downloader.subprocess.Popen", side_effect=_make_proc):
+            td = TorrentDownloader(
+                str(tmp_path), lambda t, n, p: None, lambda t, p: None,
+                max_active=1,
+            )
+            td.start()
+            td._starting.add("hold")       # occupy the only slot
+            td.add(str(magnet_file), resume=True)
+            assert spawned == []           # parked, not started
+            td._starting.discard("hold")
+            td._pump()
+            assert len(spawned) == 1
+            assert "--check-integrity=true" in spawned[0]
+            td.stop()
+
+
+# --- aria2 control files ---
+
+def test_control_file_sits_beside_a_single_file_download(tmp_path):
+    assert control_file_for(tmp_path / "movie.mkv") == tmp_path / "movie.mkv.aria2"
+
+
+def test_control_file_sits_beside_a_multi_file_folder_not_inside_it(tmp_path):
+    """The whole bug: aria2c names the control file after the top-level path,
+    so a multi-file torrent's marker is a sibling of its folder."""
+    assert control_file_for(tmp_path / "Album") == tmp_path / "Album.aria2"
+
+
+def test_a_folder_with_a_sibling_control_file_is_unfinished(tmp_path):
+    album = tmp_path / "Album"
+    (album / "disc1").mkdir(parents=True)
+    (album / "disc1" / "01.flac").write_bytes(b"part of a track")
+    (tmp_path / "Album.aria2").write_bytes(b"control")
+    assert has_incomplete_download(album) is True
+
+
+def test_a_folder_with_a_control_file_inside_is_also_unfinished(tmp_path):
+    """Web-seed fallbacks leave per-file markers within the tree."""
+    album = tmp_path / "Album"
+    album.mkdir()
+    (album / "01.flac.aria2").write_bytes(b"control")
+    assert has_incomplete_download(album) is True
+
+
+def test_a_folder_with_no_control_file_anywhere_is_finished(tmp_path):
+    album = tmp_path / "Album"
+    album.mkdir()
+    (album / "01.flac").write_bytes(b"a whole track")
+    assert has_incomplete_download(album) is False
+
+
+def test_a_file_with_its_control_file_is_unfinished(tmp_path):
+    movie = tmp_path / "movie.mkv"
+    movie.write_bytes(b"half")
+    (tmp_path / "movie.mkv.aria2").write_bytes(b"control")
+    assert has_incomplete_download(movie) is True
+
+
+def test_a_file_with_no_control_file_is_finished(tmp_path):
+    movie = tmp_path / "movie.mkv"
+    movie.write_bytes(b"all of it")
+    assert has_incomplete_download(movie) is False
+
+
+# --- staged .torrent sweep ---
+
+def test_sweep_removes_staged_copies_nothing_refers_to(tmp_path):
+    kept = tmp_path / "hoarder_torrent_keep"
+    dropped = tmp_path / "hoarder_torrent_drop"
+    kept.mkdir()
+    dropped.mkdir()
+    (kept / "a.torrent").write_bytes(b"d")
+    (dropped / "b.torrent").write_bytes(b"d")
+
+    with patch("torrent_downloader.tempfile.gettempdir", return_value=str(tmp_path)):
+        removed = sweep_stale_staged_torrents([str(kept / "a.torrent")])
+
+    assert removed == 1
+    assert kept.exists()
+    assert not dropped.exists()
+
+
+def test_sweep_leaves_unrelated_temp_directories_alone(tmp_path):
+    other = tmp_path / "something_else"
+    other.mkdir()
+    with patch("torrent_downloader.tempfile.gettempdir", return_value=str(tmp_path)):
+        assert sweep_stale_staged_torrents([]) == 0
+    assert other.exists()
+
+
+def test_sweep_ignores_magnet_targets(tmp_path):
+    """A magnet has no staged copy to keep, so it must not accidentally
+    protect some unrelated directory."""
+    stale = tmp_path / "hoarder_torrent_old"
+    stale.mkdir()
+    with patch("torrent_downloader.tempfile.gettempdir", return_value=str(tmp_path)):
+        assert sweep_stale_staged_torrents(["magnet:?xt=urn:btih:1"]) == 1
+    assert not stale.exists()
 
 
 def test_add_torrent_file_uses_info_name_not_filename(tmp_path):

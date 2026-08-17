@@ -15,6 +15,7 @@ DEFAULTS = {
     "monitor_folder": None,
     "torrent_enabled": False,
     "torrent_delete_source": False,
+    "max_active_downloads": 5,
     "move_music_enabled": False,
     "move_music_folder": None,
     "move_video_enabled": False,

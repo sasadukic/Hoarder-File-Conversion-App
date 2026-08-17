@@ -13,6 +13,9 @@ A Windows GUI tool for converting lossless audio (FLAC, ALAC, APE, etc.) to 320k
 - **Torrent Auto-Download** — Drop `.torrent` or `.magnet` files into the monitored folder (or straight onto the drop zone); they download straight into that same folder and convert when done
 - **System Tray** — Minimize to tray and run in the background
 - **Windows Startup** — Optionally start with Windows
+- **Download Limit** — Cap how many torrents transfer at once (1–20)
+- **Resume After Restart** — Unfinished downloads continue and interrupted
+  encodes re-run on the next launch
 
 ---
 
@@ -50,6 +53,12 @@ file dropped in by hand.
    way as Monitor folder.
 4. (Optional) Check **Delete torrent file after adding** to clean up
    `.torrent`/`.magnet` files once the download has started
+5. (Optional) Drag the **Active downloads** slider to cap how many torrents
+   transfer at once — 1 to 20, 5 by default. Anything over the cap is
+   accepted and shown as `QUEUED`, and starts the moment a slot frees up.
+   Raising the slider mid-session starts waiting torrents immediately;
+   lowering it never kills a transfer already in flight, it just applies to
+   what starts next.
 
 ### How It Works
 
@@ -90,6 +99,9 @@ anything left behind and checks aria2c's own `.aria2` control files — their
 absence is aria2c's authoritative "this file is done" signal — to safely
 recover anything that actually finished, and leave anything still
 downloading or genuinely interrupted alone.
+
+Anything that did *not* finish is picked up separately, on the next launch —
+see [Resuming After a Restart](#resuming-after-a-restart).
 
 ### SOCKS5 Proxy
 
@@ -140,6 +152,7 @@ All settings are persisted in `settings.json` next to the executable:
 | `monitor_folder` | Path to the monitored folder |
 | `torrent_enabled` | Enable torrent auto-download (downloads into `monitor_folder`) |
 | `torrent_delete_source` | Delete `.torrent`/`.magnet` files after adding |
+| `max_active_downloads` | How many torrents may transfer at once (1–20, default 5) |
 | `move_music_enabled` | Move converted audio out of the monitored folder after conversion |
 | `move_music_folder` | Destination for converted audio |
 | `move_video_enabled` | Move converted video out of the monitored folder after conversion |
@@ -149,6 +162,53 @@ All settings are persisted in `settings.json` next to the executable:
 | `proxy_port` | Proxy port |
 | `proxy_username` | Proxy username (optional) |
 | `proxy_password` | Proxy password (optional, stored in plaintext) |
+
+---
+
+## Resuming After a Restart
+
+Closing Hoarder kills every download and every ffmpeg run with it. `session.json`
+(next to the executable, or `%LOCALAPPDATA%\Hoarder\` when the install folder is
+read-only) records what was still unfinished, and the next launch picks it up.
+
+**Downloads genuinely resume.** The partial data and aria2c's `.aria2` control
+file are still sitting in `.hoarder-incoming`, so re-adding the torrent
+continues from where it stopped instead of starting over. What gets recorded is
+the magnet URI, or — for a `.torrent` file — the private copy Hoarder made when
+the download started, since the original may have been deleted by **Delete
+torrent file after adding** long ago. Torrents that were still waiting on the
+**Active downloads** cap are remembered too, and queue up again in the same
+order.
+
+**Encodes restart rather than resume.** ffmpeg has no way back into a
+half-written file, so an interrupted batch is run again from the beginning. Its
+partial output is deleted first: a truncated `.mp3` is indistinguishable from a
+finished one by name alone, and leaving it would either be picked up as a source
+file or collide with the rerun's own output. Nothing is lost — sources are only
+deleted once a batch actually succeeds.
+
+If something can't be resumed — a `.torrent` copy swept out of `%TEMP%`, a
+source file deleted in the meantime — that entry is dropped quietly and the rest
+still resume. A message in the drop zone reports what was picked up.
+
+**What keeps a half-finished download out of the encoder.** On startup the
+staging folder is swept for downloads an orphaned aria2c finished after the app
+itself was closed; anything complete is moved into the monitored folder to be
+converted. Three guards stop a torrent that is *not* finished from being swept
+up along with them:
+
+- aria2c's `.aria2` control file, which it writes **beside** what it is
+  downloading — for a multi-file torrent that means `Album.aria2` sits next to
+  the `Album` folder, not inside it.
+- the saved session, which names every transfer that was still in flight at
+  shutdown, and so covers a torrent killed before aria2c's first control-file
+  save had written anything.
+- resuming with `--check-integrity`, so aria2c hash-checks the partial data on
+  disk and continues from it rather than trusting a control file that may be
+  stale — or absent.
+
+Anything the session still calls unfinished stays in staging for the resume,
+however complete it looks.
 
 ---
 
@@ -205,7 +265,40 @@ py -m pytest tests/ -v
 py build.py
 ```
 
-Output: `dist/Hoarder/` — a self-contained portable folder.
+Output: `dist/Plunder.exe` — one self-contained portable file.
+
+### Windows Defender false positives
+
+A PyInstaller `--onefile` executable is a self-extracting packed binary, which
+is structurally what a dropper looks like. Defender's machine-learning
+heuristics flag these routinely under generic names — `Trojan:Win32/Wacatac.B!ml`
+and friends — and will delete the exe without asking. It is a false positive:
+the detection is on the *shape* of the file, not on anything it does.
+
+The build already avoids the two cheapest triggers:
+
+- **No UPX.** `--noupx` in `build.py`, `upx=False` in the `.spec`. Packed
+  sections are one of the strongest generic signals there is, and the few MB
+  saved are not worth a quarantine.
+- **A real version resource.** `version_info.txt` gives the exe a company name,
+  description and version, so it does not look like a freshly packed binary
+  with nothing to say for itself.
+
+If a build still gets quarantined:
+
+1. **Get it back** — Windows Security → *Virus & threat protection* →
+   *Protection history* → find the detection → *Actions* → **Restore**.
+2. **Exclude the build output** — *Virus & threat protection* → *Manage
+   settings* → *Exclusions* → *Add an exclusion* → **Folder** → the `dist`
+   folder. Exclude the folder, not the whole project, and keep it narrow.
+3. **Report it** — submit the exe at
+   <https://www.microsoft.com/en-us/wdsi/filesubmission> as a *software
+   developer*, marked **incorrectly detected**. Turnaround is usually a day or
+   two, and the correction applies to everyone rather than just this machine.
+
+The durable fix is an authenticode code-signing certificate from a CA: signed
+binaries accrue SmartScreen reputation over time. A self-signed certificate
+does not help with SmartScreen, though it does let you trust the exe locally.
 
 ---
 
@@ -219,6 +312,8 @@ Hoarder/
 ├── monitor.py           # Folder watcher (watchdog)
 ├── torrent_downloader.py # BitTorrent download engine
 ├── settings.py          # JSON settings persistence
+├── library.py           # Record of what has already been converted
+├── session.py           # Unfinished downloads/encodes, for resume on restart
 ├── cue_parser.py        # CUE sheet parser
 ├── build.py             # PyInstaller build script
 ├── bin/

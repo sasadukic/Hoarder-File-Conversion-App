@@ -15,7 +15,12 @@ from tkinter import filedialog
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import shutil
-from torrent_downloader import TorrentDownloader, STAGING_DIRNAME
+from torrent_downloader import (
+    TorrentDownloader, STAGING_DIRNAME, PROGRESS_QUEUED,
+    MIN_MAX_ACTIVE, MAX_MAX_ACTIVE, clamp_max_active,
+    ARIA2_CONTROL_SUFFIX, has_incomplete_download,
+    sweep_stale_staged_torrents,
+)
 
 import pystray
 from PIL import Image, ImageDraw, ImageFont, ImageTk
@@ -31,6 +36,7 @@ from converter import (
 import settings as smod
 import monitor as mmod
 import library as libmod
+import session as sess
 
 MODE_SPLIT  = "Split + Convert"
 MODE_CONVERT = "Convert Only"
@@ -228,18 +234,29 @@ class PixelSlider(PixelBar):
     value. Same hard-cornered, inverted-digits look as the progress bars."""
 
     def __init__(self, master, on_change=None, on_commit=None,
-                 width: int = BAR_W, height: int = BAR_H):
+                 width: int = BAR_W, height: int = BAR_H,
+                 steps: int = 10, fmt=None):
         super().__init__(master, width=width, height=height)
         self._on_change = on_change
         self._on_commit = on_commit
+        # Number of gaps between stops: 10 gives the volume slider's 10%
+        # detents, 19 puts a stop on each of 20 discrete values.
+        self._steps = max(1, steps)
+        # How the value reads inside the bar. Default is PixelBar's percentage.
+        self._fmt = fmt
         self.configure(cursor="hand2")
         self.bind("<Button-1>", self._on_drag)
         self.bind("<B1-Motion>", self._on_drag)
         self.bind("<ButtonRelease-1>", self._on_release)
 
+    def set(self, value: float, text: Optional[str] = None) -> None:
+        if text is None and self._fmt is not None:
+            text = self._fmt(min(max(value, 0.0), 1.0))
+        super().set(value, text)
+
     def _value_from_event(self, event) -> float:
         raw = min(max((event.x - 1) / (self._bar_w - 2), 0.0), 1.0)
-        return round(raw * 10) / 10  # snap to 10% steps
+        return round(raw * self._steps) / self._steps
 
     def _on_drag(self, event) -> None:
         value = self._value_from_event(event)
@@ -250,6 +267,23 @@ class PixelSlider(PixelBar):
     def _on_release(self, event) -> None:
         if self._on_commit:
             self._on_commit(self._value)
+
+
+# The active-download slider carries one stop per allowed value rather than
+# the volume slider's 10% detents, so every position is a whole number of
+# downloads and there is nothing in between to land on.
+DL_SLIDER_STEPS = MAX_MAX_ACTIVE - MIN_MAX_ACTIVE
+
+
+def dl_count_to_fraction(count) -> float:
+    """Slider position (0.0–1.0) for a download limit."""
+    return (clamp_max_active(count) - MIN_MAX_ACTIVE) / DL_SLIDER_STEPS
+
+
+def dl_fraction_to_count(fraction: float) -> int:
+    """Download limit for a slider position."""
+    fraction = min(max(fraction, 0.0), 1.0)
+    return clamp_max_active(round(fraction * DL_SLIDER_STEPS) + MIN_MAX_ACTIVE)
 
 
 def format_torrent_name(name: str, limit: int = 20) -> str:
@@ -380,7 +414,15 @@ class App(TkinterDnD.Tk):
         self._tray_icon = None
         self._is_converting = False
         self._conversion_queue: List[List[str]] = []
+        # The batch currently being encoded, once popped off the queue. Kept
+        # separately so a session record covers work in flight, not just work
+        # still waiting.
+        self._active_batch: Optional[List[str]] = None
         self._torrent_downloader: Optional[TorrentDownloader] = None
+        # Download records a restore could not act on (torrents disabled, or
+        # the staged .torrent gone). Written back out by _save_session so they
+        # are not lost along with the partial data they refer to.
+        self._unresumed_downloads: List[dict] = []
         # Files this app is about to write into the monitored folder. The
         # watcher skips them so a transcode does not re-enter the queue.
         self._ignore_paths: set[str] = set()
@@ -390,6 +432,9 @@ class App(TkinterDnD.Tk):
         self._build_ui()
         self._check_stale_startup_shortcut()
         self._check_stale_handlers()
+        # After _build_ui, so the monitor and downloader it restores are
+        # already up and the startup folder scan has had its say.
+        self.after(200, self._restore_session)
         if self._start_in_tray:
             self._go_to_tray()
         else:
@@ -677,7 +722,7 @@ class App(TkinterDnD.Tk):
             rows[name] = y
             y += ROW_PITCH
         y += GAP
-        for name in ("torrent", "torrent_delete", "magnet", "torrent_ext"):
+        for name in ("torrent", "max_downloads", "torrent_delete", "magnet", "torrent_ext"):
             rows[name] = y
             y += ROW_PITCH
         y += GAP
@@ -776,6 +821,38 @@ class App(TkinterDnD.Tk):
             variable=self._torrent_var, command=self._on_torrent_toggle, **_ck,
         )
         self._torrent_check.place(x=INNER, y=rows["torrent"])
+
+        # How many torrents may transfer at once; the rest wait their turn and
+        # show as QUEUED. Committed on release like the volume slider, and
+        # applied to a running downloader without restarting it, so raising
+        # the limit starts waiting torrents immediately.
+        self._max_downloads = clamp_max_active(s.get("max_active_downloads"))
+        # Indented to the checkbox *text* column, not the checkbox itself —
+        # this row has no checkbox of its own, and sitting flush left would
+        # break the column the rest of the torrent group reads down.
+        tk.Label(
+            setup_box, text="Active downloads", bg=BG, fg=LIGHT,
+            font=tkfont.Font(family="Silkscreen", size=-16 * SCALE), anchor="w",
+        ).place(
+            x=INNER + 28 * SCALE, y=rows["max_downloads"] + 4 * SCALE,
+            height=24 * SCALE,
+        )
+
+        def _max_downloads_commit(value: float) -> None:
+            self._max_downloads = dl_fraction_to_count(value)
+            if self._torrent_downloader is not None:
+                self._torrent_downloader.set_max_active(self._max_downloads)
+            self._save_settings()
+            self._play_checkbox()
+
+        self._max_downloads_slider = PixelSlider(
+            setup_box, on_commit=_max_downloads_commit,
+            steps=DL_SLIDER_STEPS, fmt=lambda v: str(dl_fraction_to_count(v)),
+        )
+        self._max_downloads_slider.set(dl_count_to_fraction(self._max_downloads))
+        self._max_downloads_slider.place(
+            x=row_w - BAR_W - INNER, y=rows["max_downloads"] + 7 * SCALE,
+        )
 
         self._torrent_delete_var = tk.BooleanVar(value=s.get("torrent_delete_source", False))
         self._torrent_delete_check = ctk.CTkCheckBox(
@@ -1435,6 +1512,7 @@ class App(TkinterDnD.Tk):
             "monitor_folder": self._monitor_folder_var.get() or None,
             "torrent_enabled": self._torrent_var.get(),
             "torrent_delete_source": self._torrent_delete_var.get(),
+            "max_active_downloads": self._max_downloads,
             "move_music_enabled": self._move_music_var.get(),
             "move_music_folder": self._move_music_folder_var.get() or None,
             "move_video_enabled": self._move_video_var.get(),
@@ -1584,6 +1662,8 @@ class App(TkinterDnD.Tk):
             self.after(0, self._remove_encoding_rows, task_ids)
         finally:
             self._is_converting = False
+            self._active_batch = None
+            self.after(0, self._save_session)
             self.after(0, self._process_next_queue_item)
 
     @staticmethod
@@ -2367,8 +2447,134 @@ class App(TkinterDnD.Tk):
             on_progress=self._on_torrent_progress,
             on_complete=self._on_torrent_complete,
             proxy=proxy,
+            max_active=self._max_downloads,
         )
         self._torrent_downloader.start()
+
+    # ------------------------------------------------------------------
+    # Unfinished work across restarts
+    # ------------------------------------------------------------------
+    def _encode_snapshot(self) -> List[dict]:
+        """Conversion batches not yet finished — the one in flight, then the
+        queue behind it, in the order they would run."""
+        batches = ([self._active_batch] if self._active_batch else [])
+        batches += [list(b) for b in self._conversion_queue]
+        return [{"paths": list(b)} for b in batches if b]
+
+    def _save_session(self) -> None:
+        """Write down what is still in flight, so a restart can pick it up."""
+        downloads = (
+            self._torrent_downloader.snapshot()
+            if self._torrent_downloader is not None else []
+        )
+        # Records the last restore could not act on — the downloader was off,
+        # or the staged .torrent had gone — are carried forward rather than
+        # dropped. Writing only the live snapshot would erase the record of a
+        # part-finished download the moment the app started without torrents
+        # enabled, and its partial data in staging would be orphaned for good.
+        downloads += self._unresumed_downloads
+        sess.save(downloads, self._encode_snapshot())
+
+    def _restore_session(self) -> None:
+        """Resume the downloads and re-run the conversions the last run left.
+
+        Downloads genuinely resume: aria2c picks up from the partial data and
+        its control file still sitting in staging. Encodes cannot — ffmpeg has
+        no way back into a half-written file — so an interrupted batch is run
+        again from the start, after its partial output is cleared away.
+        """
+        state = sess.load()
+        resumed = self._resume_downloads(state["downloads"])
+        requeued = self._resume_encodes(state["encodes"])
+        self._save_session()
+        self._sweep_staged_torrents()
+        if resumed or requeued:
+            parts = []
+            if resumed:
+                parts.append(f"{resumed} download{'s' if resumed != 1 else ''}")
+            if requeued:
+                parts.append(f"{requeued} encode{'s' if requeued != 1 else ''}")
+            self._set_info(f"Resumed {' and '.join(parts)}", SAGE)
+
+    def _sweep_staged_torrents(self) -> None:
+        """Drop the staged .torrent copies nothing unfinished refers to.
+
+        Run right after a restore, when the session file has just been
+        rewritten and therefore names every transfer still worth keeping.
+        """
+        live = [r.get("target", "") for r in sess.load()["downloads"]]
+        if self._torrent_downloader is not None:
+            live += [r.get("target", "") for r in self._torrent_downloader.snapshot()]
+        sweep_stale_staged_torrents(live)
+
+    def _resume_downloads(self, records: List[dict]) -> int:
+        """Hand every still-usable record back to the downloader.
+
+        Anything not restarted here is kept in _unresumed_downloads instead of
+        being forgotten, so _save_session writes it out again and both the
+        record and the partial data in staging survive to the next launch.
+        """
+        self._unresumed_downloads = []
+        if not records:
+            return 0
+        if self._torrent_downloader is None:
+            # Nowhere to put them, but the record is worth keeping: enable the
+            # monitor and downloader later and the next launch resumes them.
+            self._unresumed_downloads = [dict(r) for r in records]
+            return 0
+        resumed = 0
+        for rec in records:
+            target = rec.get("target") or ""
+            # A magnet URI is always usable; a staged .torrent copy may have
+            # been swept out of %TEMP% since, in which case the transfer
+            # cannot be restarted from here.
+            if not target.startswith("magnet:?") and not Path(target).is_file():
+                continue
+            # resume=True: the partial data is already in staging, so aria2c
+            # is told to hash-check and continue rather than trust a control
+            # file that may be stale or missing entirely.
+            if self._torrent_downloader.add(target, resume=True) is not None:
+                resumed += 1
+        return resumed
+
+    def _resume_encodes(self, records: List[dict]) -> int:
+        """Re-queue interrupted conversion batches.
+
+        The first record is whatever was actually mid-encode, so its partial
+        output is deleted before the rerun. Later records never started, and
+        have nothing to clean up.
+        """
+        requeued = 0
+        for i, rec in enumerate(records):
+            paths = [p for p in rec.get("paths", []) if Path(p).exists()]
+            if not paths:
+                continue
+            if i == 0:
+                self._discard_partial_outputs(paths)
+            if self._enqueue_conversion(paths):
+                requeued += 1
+        return requeued
+
+    def _discard_partial_outputs(self, paths: List[str]) -> None:
+        """Delete the outputs an interrupted batch had begun writing.
+
+        A truncated .mp3/.mp4 left mid-encode is indistinguishable from a
+        finished one by name alone, and leaving it would either be picked up
+        as a source file or collide with the rerun's own output. The sources
+        are still on disk (they are only deleted after a batch succeeds), so
+        throwing the partial away costs nothing but the encode time.
+        """
+        _, flacs, cue, videos, error = detect_mode(paths)
+        if error:
+            return
+        outputs = self._audio_outputs(flacs, cue) + self._video_outputs(videos)
+        for out in outputs:
+            try:
+                p = Path(out)
+                if p.is_file():
+                    p.unlink()
+            except OSError:
+                pass
 
     def _stop_torrent_downloader(self) -> None:
         if self._torrent_downloader:
@@ -2381,6 +2587,14 @@ class App(TkinterDnD.Tk):
         self.after(0, self._update_torrent_progress, tid, name, progress)
 
     def _update_torrent_progress(self, tid: str, name: str, progress: float) -> None:
+        if progress == PROGRESS_QUEUED:
+            # Over the concurrency limit: the torrent is accepted and shown,
+            # it just hasn't been handed to a downloader yet.
+            if tid not in self._torrent_progress_widgets:
+                self._add_torrent_progress_row(tid, name)
+            self._torrent_progress_widgets[tid]["bar"].set(0, "QUEUED")
+            self._save_session()
+            return
         if progress < 0:
             if tid not in self._torrent_progress_widgets:
                 self._add_torrent_progress_row(tid, name)
@@ -2388,10 +2602,16 @@ class App(TkinterDnD.Tk):
             widgets["bar"].set(0, "ERROR")
             widgets["name_lbl"].config(fg=WARM)
             self.after(5000, self._remove_torrent_progress, tid)
+            self._save_session()
             return
-        if tid not in self._torrent_progress_widgets:
+        new_row = tid not in self._torrent_progress_widgets
+        if new_row:
             self._add_torrent_progress_row(tid, name)
         self._torrent_progress_widgets[tid]["bar"].set(progress)
+        # Only when the set of live downloads actually changes — a progress
+        # tick a second per torrent is not worth a disk write.
+        if new_row or progress >= 1.0:
+            self._save_session()
 
     def _add_torrent_progress_row(self, tid: str, name: str) -> None:
         self._play_torrent_added()
@@ -2432,6 +2652,7 @@ class App(TkinterDnD.Tk):
         """
         self._play_torrent_downloaded()
         self._remove_torrent_progress(tid)
+        self._save_session()
         monitor_folder = self._monitor_folder_var.get()
         if not monitor_folder:
             return
@@ -2539,14 +2760,27 @@ class App(TkinterDnD.Tk):
         Entries that still have one are left alone: still downloading (by
         an orphaned process) or genuinely interrupted, either way not safe
         to convert yet.
+
+        The control file is not the only guard. It is written periodically
+        rather than continuously, so a transfer killed seconds after it
+        started may have none at all — and the saved session, which lists
+        every transfer that was still in flight at shutdown, is the record
+        that survives that. Anything it still names is left in staging for
+        _resume_downloads to pick up, however complete it looks here.
         """
         staging = Path(monitor_folder) / STAGING_DIRNAME
         if not staging.is_dir():
             return
+        unfinished = self._unfinished_download_names()
         recovered = 0
         for entry in list(staging.iterdir()):
-            if entry.suffix == ".aria2":
-                continue  # a control file, never real content on its own
+            if entry.suffix in (ARIA2_CONTROL_SUFFIX, ".torrent"):
+                # aria2c's own bookkeeping — a control file, or the metadata
+                # it saved for a magnet. Never content, and moving either one
+                # into the monitored folder would have the watcher re-add it.
+                continue
+            if entry.name in unfinished:
+                continue
             if self._has_incomplete_download(entry):
                 continue
             try:
@@ -2559,11 +2793,29 @@ class App(TkinterDnD.Tk):
             self._set_info(f"Recovered {recovered} interrupted download{plural}", SAGE)
 
     @staticmethod
+    def _unfinished_download_names() -> set:
+        """Content names the saved session still lists as in flight.
+
+        Read from disk rather than from the live downloader: at startup this
+        runs before the resume does, and after a resume the same names are
+        written straight back, so either way it reflects what must not be
+        swept out of staging.
+        """
+        try:
+            records = sess.load()["downloads"]
+        except Exception:
+            return set()
+        return {r.get("name", "") for r in records if r.get("name")}
+
+    @staticmethod
     def _has_incomplete_download(path: Path) -> bool:
-        """True if aria2c still considers something under *path* unfinished."""
-        if path.is_file():
-            return Path(str(path) + ".aria2").exists()
-        return any(path.rglob("*.aria2"))
+        """True if aria2c still considers anything at or under *path* unfinished.
+
+        Delegates so the ".aria2" placement rule lives in exactly one place:
+        aria2c writes the control file *beside* what it is downloading, which
+        for a multi-file torrent means beside the folder, not inside it.
+        """
+        return has_incomplete_download(path)
 
     def _scan_existing_files(self, folder: str) -> None:
         """Queue conversion jobs for everything already sitting in *folder*."""
@@ -2676,7 +2928,7 @@ class App(TkinterDnD.Tk):
         if fresh:
             self._enqueue_conversion(fresh)
 
-    def _enqueue_conversion(self, paths: List[str]) -> None:
+    def _enqueue_conversion(self, paths: List[str]) -> bool:
         """Validate *paths* and add them to the conversion queue.
 
         Silently ignores batches that detect_mode rejects (e.g. unsupported
@@ -2688,16 +2940,36 @@ class App(TkinterDnD.Tk):
         (e.g. every disc of a multi-folder torrent) shows the full pending
         list immediately instead of revealing one folder at a time as each
         prior one finishes.
+
+        Returns whether the batch was actually taken on.
         """
         _, flacs, _, videos, error = detect_mode(paths)
         if error:
-            return
+            return False
+        # Two paths can legitimately reach the same batch — the startup folder
+        # scan and a resumed session both offer the monitored folder's files —
+        # and encoding the same file twice would race two ffmpeg runs onto one
+        # output. The library can't catch this: it only knows what has already
+        # finished, not what is queued right now.
+        if self._already_queued(paths):
+            return False
         self._conversion_queue.append(paths)
         for f in flacs:
             self.after(0, self._add_encoding_progress, f, Path(f).name)
         for v in videos:
             self.after(0, self._add_encoding_progress, v, Path(v).name)
+        self._save_session()
         self._process_next_queue_item()
+        return True
+
+    def _already_queued(self, paths: List[str]) -> bool:
+        """True if any of *paths* is already queued or being converted."""
+        pending = set()
+        for batch in self._conversion_queue:
+            pending.update(self._ignore_key(p) for p in batch)
+        if self._active_batch:
+            pending.update(self._ignore_key(p) for p in self._active_batch)
+        return any(self._ignore_key(p) in pending for p in paths)
 
     def _process_next_queue_item(self) -> None:
         """Pop and start the next batch from the queue if the app is idle.
@@ -2708,6 +2980,8 @@ class App(TkinterDnD.Tk):
         if self._is_converting or not self._conversion_queue:
             return
         paths = self._conversion_queue.pop(0)
+        self._active_batch = list(paths)
+        self._save_session()
         self._load_files(paths)
         # Start even when auto_convert is off (monitor items always convert).
         # If _load_files already started it (auto_convert=True) this is a no-op
@@ -2778,6 +3052,13 @@ class App(TkinterDnD.Tk):
     # Cleanup
     # ------------------------------------------------------------------
     def destroy(self) -> None:
+        # Before anything is torn down: stopping the downloader clears the
+        # very state a snapshot is built from, so saving afterwards would
+        # record an empty session and strand every part-finished transfer.
+        try:
+            self._save_session()
+        except Exception:
+            pass  # never let bookkeeping block the shutdown
         self._stop_monitor()
         self._stop_torrent_downloader()
         if self._tray_icon is not None:

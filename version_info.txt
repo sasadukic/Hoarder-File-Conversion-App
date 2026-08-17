@@ -1,0 +1,45 @@
+# Windows version resource for Plunder.exe (PyInstaller --version-file).
+#
+# Why this file exists: an unsigned PyInstaller executable with no version
+# resource at all is one of the shapes Microsoft Defender's generic
+# heuristics score as suspicious (it is what freshly packed malware looks
+# like). Real metadata does not make the exe trusted, but it removes one of
+# the cheap signals that push an otherwise ordinary program over the line
+# into a "Trojan:Win32/Wacatac"-style detection.
+#
+# Bump the four numbers together when the version changes - filevers and
+# prodvers are tuples, FileVersion and ProductVersion are the strings that
+# actually show up in the file's Properties dialog.
+
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          '040904B0',
+          [
+            StringStruct('CompanyName', 'Psilocybian'),
+            StringStruct('FileDescription', 'Plunder - audio and video transcoder with torrent auto-download'),
+            StringStruct('FileVersion', '1.0.0.0'),
+            StringStruct('InternalName', 'Plunder'),
+            StringStruct('LegalCopyright', 'Copyright (c) Psilocybian'),
+            StringStruct('OriginalFilename', 'Plunder.exe'),
+            StringStruct('ProductName', 'Plunder'),
+            StringStruct('ProductVersion', '1.0.0.0'),
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build Plunder as a single portable executable.
+r"""Build Plunder as a single portable executable.
 
 Usage:
     py build.py
@@ -20,6 +20,24 @@ Notes:
       for true single-file portability — see build.py's git history if that
       tradeoff ever needs revisiting.
     - PyInstaller is installed automatically if not already present.
+
+Windows Defender:
+    A PyInstaller onefile exe is a self-extracting packed binary, which is
+    structurally what a dropper looks like — so Defender's generic heuristics
+    flag these routinely, with names like "Trojan:Win32/Wacatac.B!ml". Two
+    build settings make that materially less likely and cost nothing:
+
+      --noupx         UPX-packed sections are one of the strongest generic
+                      heuristic signals there is. The compression saves a few
+                      MB and buys a detection.
+      --version-file  An executable carrying no version resource at all is
+                      another cheap signal — it is what a freshly packed
+                      binary looks like. version_info.txt fills it in.
+
+    Neither is a guarantee. The real fix is a code-signing certificate from a
+    CA, which accrues SmartScreen reputation over time; short of that, report
+    any false positive to Microsoft (see README) so the definition is
+    corrected for everyone rather than only on this machine.
 """
 
 import shutil
@@ -119,6 +137,10 @@ def main() -> None:
         "--windowed",                      # no console window
         "--name", "Plunder",
         "--icon", str(HERE / "hoarder.ico"),
+        # Both of these exist to keep Defender's generic heuristics calm —
+        # see the module docstring.
+        "--noupx",
+        "--version-file", str(HERE / "version_info.txt"),
         "--noconfirm",
         "--clean",
     ]

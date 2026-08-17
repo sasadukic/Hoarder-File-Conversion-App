@@ -543,6 +543,9 @@ class _TorrentCompleteHost:
     def _play_torrent_downloaded(self):
         pass
 
+    def _save_session(self):
+        pass
+
     def _enqueue_conversion(self, paths):
         self.enqueued.append(paths)
 
@@ -721,17 +724,24 @@ class _EnqueueHost:
     processing (that path spawns threads/ffmpeg — out of scope here)."""
 
     _enqueue_conversion = App._enqueue_conversion
+    _already_queued = App._already_queued
+    _ignore_key = staticmethod(App._ignore_key)
 
     def __init__(self):
         self._conversion_queue = []
+        self._active_batch = None
         self.added_rows = []
         self.queue_processed = False
+        self.sessions_saved = 0
 
     def after(self, _delay, fn, *args):
         fn(*args)
 
     def _add_encoding_progress(self, task_id, name):
         self.added_rows.append(task_id)
+
+    def _save_session(self):
+        self.sessions_saved += 1
 
     def _process_next_queue_item(self):
         self.queue_processed = True
@@ -799,8 +809,12 @@ class _RecoveryHost:
     _has_incomplete_download = staticmethod(_App._has_incomplete_download)
     _move_into_monitor_folder = staticmethod(_App._move_into_monitor_folder)
 
-    def __init__(self):
+    def __init__(self, unfinished=()):
         self.infos = []
+        self._unfinished = set(unfinished)
+
+    def _unfinished_download_names(self):
+        return self._unfinished
 
     def _set_info(self, text, color):
         self.infos.append(text)
@@ -867,6 +881,61 @@ def test_recover_leaves_directory_with_any_incomplete_file(tmp_path):
 
     assert album.exists()
     assert not (monitor / "Album").exists()
+    assert host.infos == []
+
+
+def test_recover_leaves_multi_file_torrent_with_sibling_control_file(tmp_path):
+    """aria2c parks a multi-file torrent's control file *beside* the folder,
+    not inside it — checking only inside made a half-finished album look
+    complete, so it was swept into the monitored folder and encoded instead
+    of being resumed."""
+    monitor = tmp_path / "monitor"
+    staging = monitor / ".hoarder-incoming"
+    album = staging / "Album"
+    album.mkdir(parents=True)
+    (album / "01.flac").write_bytes(b"half a track")
+    (staging / "Album.aria2").write_bytes(b"aria2 control data")
+
+    host = _RecoveryHost()
+    host._recover_staged_downloads(str(monitor))
+
+    assert album.exists()
+    assert not (monitor / "Album").exists()
+    assert host.infos == []
+
+
+def test_recover_leaves_anything_the_session_still_calls_unfinished(tmp_path):
+    """A transfer killed before aria2c's first control-file save has no marker
+    at all. The saved session is what remembers it."""
+    monitor = tmp_path / "monitor"
+    staging = monitor / ".hoarder-incoming"
+    album = staging / "Album"
+    album.mkdir(parents=True)
+    (album / "01.flac").write_bytes(b"a few pieces")
+
+    host = _RecoveryHost(unfinished={"Album"})
+    host._recover_staged_downloads(str(monitor))
+
+    assert album.exists()
+    assert not (monitor / "Album").exists()
+    assert host.infos == []
+
+
+def test_recover_ignores_aria2_bookkeeping_files(tmp_path):
+    """Neither a control file nor the .torrent aria2c saves for a magnet is
+    content — moving either into the monitored folder would have the watcher
+    re-add the torrent."""
+    monitor = tmp_path / "monitor"
+    staging = monitor / ".hoarder-incoming"
+    staging.mkdir(parents=True)
+    (staging / "orphan.aria2").write_bytes(b"control")
+    (staging / "abc123.torrent").write_bytes(b"metadata")
+
+    host = _RecoveryHost()
+    host._recover_staged_downloads(str(monitor))
+
+    assert (staging / "orphan.aria2").exists()
+    assert (staging / "abc123.torrent").exists()
     assert host.infos == []
 
 
@@ -942,6 +1011,7 @@ class _SaveSettingsHost:
         self._proxy_password_var = _var("")
         self._torrent_ext_asked = False
         self._sound_volume = 100
+        self._max_downloads = 5
 
 
 def test_save_settings_writes_every_default_key(monkeypatch):
@@ -1159,6 +1229,330 @@ def test_frozen_build_reclaims_a_live_but_different_registration(monkeypatch, tm
     assert host.magnet_registrations == 1
 
 
+# --- active-downloads slider ---
+
+from gui import dl_count_to_fraction, dl_fraction_to_count, DL_SLIDER_STEPS
+
+
+def test_slider_has_one_stop_per_allowed_value():
+    """20 values means 19 gaps — every drag position lands on a whole
+    number of downloads, with nothing in between to stop on."""
+    assert DL_SLIDER_STEPS == 19
+    stops = {dl_fraction_to_count(i / DL_SLIDER_STEPS) for i in range(DL_SLIDER_STEPS + 1)}
+    assert stops == set(range(1, 21))
+
+
+def test_count_fraction_round_trip():
+    for n in range(1, 21):
+        assert dl_fraction_to_count(dl_count_to_fraction(n)) == n
+
+
+def test_slider_ends_map_to_the_limits():
+    assert dl_fraction_to_count(0.0) == 1
+    assert dl_fraction_to_count(1.0) == 20
+    assert dl_count_to_fraction(1) == 0.0
+    assert dl_count_to_fraction(20) == 1.0
+
+
+def test_default_of_five_sits_where_it_should():
+    assert dl_fraction_to_count(dl_count_to_fraction(5)) == 5
+    assert 0.2 < dl_count_to_fraction(5) < 0.25
+
+
+def test_out_of_range_values_are_clamped_not_dropped():
+    assert dl_count_to_fraction(0) == dl_count_to_fraction(1)
+    assert dl_count_to_fraction(500) == dl_count_to_fraction(20)
+
+
+# --- queue de-duplication ---
+#
+# The startup folder scan and a resumed session can both offer the same file.
+# Encoding it twice would race two ffmpeg runs onto one output path, and the
+# library cannot catch it — it only records what has already finished.
+
+class _DedupeHost:
+    _enqueue_conversion = _App._enqueue_conversion
+    _already_queued = _App._already_queued
+    _ignore_key = staticmethod(_App._ignore_key)
+
+    def __init__(self):
+        self._conversion_queue = []
+        self._active_batch = None
+        self.added_rows = []
+
+    def after(self, _delay, fn, *args):
+        fn(*args)
+
+    def _add_encoding_progress(self, task_id, name):
+        self.added_rows.append(task_id)
+
+    def _save_session(self):
+        pass
+
+    def _process_next_queue_item(self):
+        pass
+
+
+def test_the_same_batch_offered_twice_is_queued_once(tmp_path):
+    f = tmp_path / "01.flac"
+    f.write_bytes(b"a")
+    host = _DedupeHost()
+    host._enqueue_conversion([str(f)])
+    host._enqueue_conversion([str(f)])
+    assert host._conversion_queue == [[str(f)]]
+    assert host.added_rows == [str(f)]
+
+
+def test_a_batch_overlapping_the_one_in_flight_is_skipped(tmp_path):
+    f = tmp_path / "01.flac"
+    f.write_bytes(b"a")
+    host = _DedupeHost()
+    host._active_batch = [str(f)]        # popped off the queue, mid-encode
+    host._enqueue_conversion([str(f)])
+    assert host._conversion_queue == []
+
+
+def test_enqueue_reports_whether_it_took_the_batch(tmp_path):
+    f = tmp_path / "01.flac"
+    f.write_bytes(b"a")
+    host = _DedupeHost()
+    assert host._enqueue_conversion([str(f)]) is True
+    assert host._enqueue_conversion([str(f)]) is False       # duplicate
+    assert host._enqueue_conversion([str(tmp_path / "x.txt")]) is False  # rejected
+
+
+def test_different_files_still_queue_normally(tmp_path):
+    f1, f2 = tmp_path / "01.flac", tmp_path / "02.flac"
+    f1.write_bytes(b"a")
+    f2.write_bytes(b"b")
+    host = _DedupeHost()
+    host._enqueue_conversion([str(f1)])
+    host._enqueue_conversion([str(f2)])
+    assert host._conversion_queue == [[str(f1)], [str(f2)]]
+
+
+def test_dedupe_ignores_path_spelling(tmp_path):
+    """The watcher and a session record can spell the same file differently."""
+    f = tmp_path / "01.flac"
+    f.write_bytes(b"a")
+    host = _DedupeHost()
+    host._enqueue_conversion([str(f)])
+    host._enqueue_conversion([str(tmp_path / "." / "01.flac")])
+    assert host._conversion_queue == [[str(f)]]
+
+
+# --- resuming unfinished work ---
+
+class _ResumeHost:
+    _restore_session = _App._restore_session
+    _resume_downloads = _App._resume_downloads
+    _resume_encodes = _App._resume_encodes
+    _discard_partial_outputs = _App._discard_partial_outputs
+    _encode_snapshot = _App._encode_snapshot
+    _audio_outputs = staticmethod(_App._audio_outputs)
+    _video_outputs = staticmethod(_App._video_outputs)
+
+    def __init__(self, downloader=None):
+        self._torrent_downloader = downloader
+        self._conversion_queue = []
+        self._active_batch = None
+        self._is_converting = False
+        self._unresumed_downloads = []
+        self.enqueued = []
+        self.infos = []
+        self.swept = 0
+
+    def _sweep_staged_torrents(self):
+        self.swept += 1
+
+    def _enqueue_conversion(self, paths):
+        self.enqueued.append(list(paths))
+        self._conversion_queue.append(list(paths))
+        return True
+
+    def _save_session(self):
+        pass
+
+    def _set_info(self, text, color=None):
+        self.infos.append(text)
+
+
+class _FakeDownloader:
+    def __init__(self, accept=True):
+        self.added = []
+        self.resume_flags = []
+        self._accept = accept
+
+    def add(self, target, resume=False):
+        self.added.append(target)
+        self.resume_flags.append(resume)
+        return "tid" if self._accept else None
+
+
+def test_magnet_downloads_are_resumed():
+    dl = _FakeDownloader()
+    host = _ResumeHost(dl)
+    n = host._resume_downloads([
+        {"tid": "a", "target": "magnet:?xt=urn:btih:1", "name": "One"},
+        {"tid": "b", "target": "magnet:?xt=urn:btih:2", "name": "Two"},
+    ])
+    assert n == 2
+    assert dl.added == ["magnet:?xt=urn:btih:1", "magnet:?xt=urn:btih:2"]
+
+
+def test_a_torrent_whose_staged_copy_is_gone_is_skipped(tmp_path):
+    """%TEMP% may have been swept since — there is nothing left to resume from."""
+    live = tmp_path / "still-here.torrent"
+    live.write_bytes(b"d4:infod4:name5:Movieee")
+    dl = _FakeDownloader()
+    host = _ResumeHost(dl)
+    n = host._resume_downloads([
+        {"tid": "a", "target": str(tmp_path / "swept-away.torrent"), "name": "Gone"},
+        {"tid": "b", "target": str(live), "name": "Here"},
+    ])
+    assert n == 1
+    assert dl.added == [str(live)]
+
+
+def test_resumed_downloads_are_flagged_as_resumes():
+    """aria2c only hash-checks the partial data already in staging when it is
+    told this is a resume; without that a stale or missing control file means
+    the transfer starts again from zero."""
+    dl = _FakeDownloader()
+    host = _ResumeHost(dl)
+    host._resume_downloads([
+        {"tid": "a", "target": "magnet:?xt=urn:btih:1", "name": "One"},
+    ])
+    assert dl.resume_flags == [True]
+
+
+def test_downloads_are_not_resumed_without_a_downloader():
+    host = _ResumeHost(downloader=None)
+    assert host._resume_downloads([
+        {"tid": "a", "target": "magnet:?xt=urn:btih:1", "name": "One"},
+    ]) == 0
+
+
+def test_records_a_restore_cannot_act_on_are_carried_forward():
+    """Starting once with torrents disabled must not erase the record of a
+    part-finished download — its data is still sitting in staging."""
+    records = [{"tid": "a", "target": "magnet:?xt=urn:btih:1", "name": "One"}]
+    host = _ResumeHost(downloader=None)
+    host._resume_downloads(records)
+    assert host._unresumed_downloads == records
+
+
+def test_a_resumed_record_is_not_also_carried_forward():
+    """It is live in the downloader now, so the snapshot covers it — keeping
+    it here as well would write the same transfer out twice."""
+    host = _ResumeHost(_FakeDownloader())
+    host._resume_downloads([
+        {"tid": "a", "target": "magnet:?xt=urn:btih:1", "name": "One"},
+    ])
+    assert host._unresumed_downloads == []
+
+
+def test_a_torrent_whose_staged_copy_is_gone_is_dropped_for_good(tmp_path):
+    """There is nothing left to start it from, ever. Keeping the record would
+    pin its staging folder in place forever, so an orphaned aria2c that did
+    finish it could never be recovered either."""
+    host = _ResumeHost(_FakeDownloader())
+    host._resume_downloads([
+        {"tid": "a", "target": str(tmp_path / "swept.torrent"), "name": "Gone"},
+    ])
+    assert host._unresumed_downloads == []
+
+
+def test_a_download_the_backend_rejects_is_not_counted():
+    dl = _FakeDownloader(accept=False)
+    host = _ResumeHost(dl)
+    assert host._resume_downloads([
+        {"tid": "a", "target": "magnet:?xt=urn:btih:1", "name": "One"},
+    ]) == 0
+
+
+def test_interrupted_encodes_are_requeued(tmp_path):
+    f1, f2 = tmp_path / "01.flac", tmp_path / "02.flac"
+    f1.write_bytes(b"a")
+    f2.write_bytes(b"b")
+    host = _ResumeHost()
+    n = host._resume_encodes([{"paths": [str(f1)]}, {"paths": [str(f2)]}])
+    assert n == 2
+    assert host.enqueued == [[str(f1)], [str(f2)]]
+
+
+def test_encode_records_for_deleted_files_are_dropped(tmp_path):
+    """Delete-after-conversion may already have removed the sources."""
+    host = _ResumeHost()
+    assert host._resume_encodes([{"paths": [str(tmp_path / "gone.flac")]}]) == 0
+    assert host.enqueued == []
+
+
+def test_the_interrupted_batch_loses_its_half_written_output(tmp_path):
+    """A truncated .mp3 is indistinguishable from a finished one by name, so
+    the rerun must not find one waiting."""
+    src = tmp_path / "01.flac"
+    src.write_bytes(b"a")
+    partial = tmp_path / "01.mp3"
+    partial.write_bytes(b"half an encode")
+
+    host = _ResumeHost()
+    host._resume_encodes([{"paths": [str(src)]}])
+    assert not partial.exists()
+    assert src.exists()          # the source is what the rerun needs
+
+
+def test_queued_but_never_started_batches_keep_their_files(tmp_path):
+    """Only the first record was mid-encode; the rest never ran, so an mp3
+    sitting beside them is somebody else's finished work."""
+    started, queued = tmp_path / "01.flac", tmp_path / "02.flac"
+    started.write_bytes(b"a")
+    queued.write_bytes(b"b")
+    (tmp_path / "01.mp3").write_bytes(b"partial")
+    untouched = tmp_path / "02.mp3"
+    untouched.write_bytes(b"finished earlier")
+
+    host = _ResumeHost()
+    host._resume_encodes([{"paths": [str(started)]}, {"paths": [str(queued)]}])
+    assert untouched.read_bytes() == b"finished earlier"
+
+
+def test_encode_snapshot_puts_the_batch_in_flight_first(tmp_path):
+    host = _ResumeHost()
+    host._active_batch = ["/a/01.flac"]
+    host._conversion_queue = [["/b/02.flac"], ["/c/03.flac"]]
+    assert host._encode_snapshot() == [
+        {"paths": ["/a/01.flac"]},
+        {"paths": ["/b/02.flac"]},
+        {"paths": ["/c/03.flac"]},
+    ]
+
+
+def test_encode_snapshot_is_empty_when_idle():
+    assert _ResumeHost()._encode_snapshot() == []
+
+
+def test_restore_reports_what_it_picked_up(tmp_path, monkeypatch):
+    import session as sess
+    f = tmp_path / "01.flac"
+    f.write_bytes(b"a")
+    monkeypatch.setattr(sess, "load", lambda: {
+        "downloads": [{"tid": "a", "target": "magnet:?xt=urn:btih:1", "name": "One"}],
+        "encodes": [{"paths": [str(f)]}],
+    })
+    host = _ResumeHost(_FakeDownloader())
+    host._restore_session()
+    assert host.infos == ["Resumed 1 download and 1 encode"]
+
+
+def test_restore_says_nothing_when_there_was_nothing_to_resume(monkeypatch):
+    import session as sess
+    monkeypatch.setattr(sess, "load", lambda: {"downloads": [], "encodes": []})
+    host = _ResumeHost(_FakeDownloader())
+    host._restore_session()
+    assert host.infos == []
+
+
 def test_maybe_prompt_shows_when_neither_asked_nor_registered():
     host = _TorrentAssocHost(already_registered=False)
     host._torrent_ext_asked = False
@@ -1185,6 +1579,46 @@ def test_bar_fill_clamps_out_of_range_values():
 def test_bar_fill_is_monotonic():
     widths = [PixelBar._fill_px(i / 100, BAR_W) for i in range(101)]
     assert widths == sorted(widths)
+
+
+# --- slider snapping ---
+#
+# _value_from_event only reads _bar_w and _steps off the widget, so it can be
+# exercised on a stand-in rather than a real Tk canvas.
+
+from gui import PixelSlider
+
+
+class _Track:
+    def __init__(self, steps):
+        self._bar_w = BAR_W
+        self._steps = steps
+
+
+def _at(steps, x):
+    return PixelSlider._value_from_event(_Track(steps), types.SimpleNamespace(x=x))
+
+
+def test_a_drag_lands_on_a_whole_number_of_downloads():
+    """Anywhere the user lets go, the value is one of the 20 allowed."""
+    for x in range(0, BAR_W + 20, 3):
+        assert dl_fraction_to_count(_at(DL_SLIDER_STEPS, x)) in range(1, 21)
+
+
+def test_dragging_past_either_end_clamps():
+    assert _at(DL_SLIDER_STEPS, -50) == 0.0
+    assert _at(DL_SLIDER_STEPS, BAR_W + 50) == 1.0
+
+
+def test_the_track_covers_every_value_from_one_to_twenty():
+    seen = {dl_fraction_to_count(_at(DL_SLIDER_STEPS, x)) for x in range(BAR_W + 1)}
+    assert seen == set(range(1, 21))
+
+
+def test_the_volume_slider_keeps_its_ten_percent_detents():
+    assert _at(10, 1) == 0.0
+    assert _at(10, BAR_W - 1) == 1.0
+    assert all(round(_at(10, x) * 10, 6).is_integer() for x in range(BAR_W))
 
 
 # --- conversion outputs (what gets recorded in the library) ---

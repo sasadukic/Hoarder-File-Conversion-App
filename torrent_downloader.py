@@ -27,6 +27,35 @@ _LOCAL_ARIA2C = Path(__file__).parent / "bin" / "aria2c.exe"
 # actually finished.
 STAGING_DIRNAME = ".hoarder-incoming"
 
+# aria2c records an unfinished transfer's progress in a control file and
+# deletes it the moment that transfer is done, so the file's presence is
+# aria2c's own authoritative "not finished yet" signal.
+ARIA2_CONTROL_SUFFIX = ".aria2"
+
+
+def control_file_for(path: Path) -> Path:
+    """Where aria2c keeps the control file for the download at *path*.
+
+    aria2c appends ".aria2" to the top-level path it is writing. For a
+    single-file torrent that is ``file.ext.aria2`` sitting beside the file;
+    for a multi-file torrent it is ``Album.aria2`` sitting beside — **not
+    inside** — the ``Album`` folder. Looking only inside the folder is what
+    let a half-finished album read as complete.
+    """
+    return path.with_name(path.name + ARIA2_CONTROL_SUFFIX)
+
+
+def has_incomplete_download(path: Path) -> bool:
+    """True if aria2c still considers anything at or under *path* unfinished."""
+    if control_file_for(path).exists():
+        return True
+    if not path.is_dir():
+        return False
+    # Belt and braces: aria2c also leaves per-file control files for the
+    # plain HTTP/FTP sources a torrent's web seeds can fall back to.
+    return any(path.rglob("*" + ARIA2_CONTROL_SUFFIX))
+
+
 # aria2c summary lines look like:  [#2089b0 400KiB/33MiB(1%) CN:1 DL:115KiB ETA:4m51s]
 #
 # Anchor the percentage to the aggregate "[#gid ...]" line — a bare "(n%)"
@@ -35,6 +64,19 @@ STAGING_DIRNAME = ".hoarder-incoming"
 _ARIA2_PCT_RE = re.compile(r"^\[#[0-9a-fA-F]+\b.*?\((\d{1,3}(?:\.\d+)?)%\)")
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+# Progress sentinels handed to on_progress. Real progress is 0.0–1.0; these sit
+# outside that range so a single callback can carry state as well as a value.
+PROGRESS_ERROR = -1.0
+PROGRESS_QUEUED = -2.0
+
+# How many torrents may transfer at once before the rest wait their turn.
+DEFAULT_MAX_ACTIVE = 5
+MIN_MAX_ACTIVE = 1
+MAX_MAX_ACTIVE = 20
+
+# Seconds between aria2c control-file saves (its own default is 60).
+CONTROL_SAVE_INTERVAL = 5
 
 def _find_aria2c() -> Optional[str]:
     if _LOCAL_ARIA2C.exists():
@@ -95,6 +137,41 @@ def _extract_magnet_name(uri: str) -> Optional[str]:
         return unquote(match.group(1).replace("+", " "))
     return None
 
+def sweep_stale_staged_torrents(keep: Any = ()) -> int:
+    """Delete staged .torrent copies no unfinished transfer refers to.
+
+    _stage_torrent hands aria2c a private copy of every .torrent so the user's
+    "delete after adding" can't pull it out from under a running download, and
+    the copy is deliberately left behind at shutdown — it is the only thing a
+    resume can be started from. Once a resume has happened (or the record is
+    gone), the copy is dead weight in %TEMP%, so each restore sweeps whatever
+    is no longer referenced.
+
+    Returns the number of temp directories removed.
+    """
+    keep_dirs = {str(Path(t).parent) for t in keep if isinstance(t, str) and t}
+    removed = 0
+    try:
+        entries = list(Path(tempfile.gettempdir()).glob("hoarder_torrent_*"))
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.is_dir() or str(entry) in keep_dirs:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        removed += 1
+    return removed
+
+
+def clamp_max_active(value: Any) -> int:
+    """Coerce a stored/UI concurrency limit into the supported range."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_ACTIVE
+    return max(MIN_MAX_ACTIVE, min(MAX_MAX_ACTIVE, n))
+
+
 def check_proxy_reachable(host: str, port: int, timeout: float = 3.0) -> bool:
     """One-shot TCP reachability check, run when the user saves proxy settings.
 
@@ -117,12 +194,14 @@ class TorrentDownloader:
         on_progress: Callable[[str, str, float], None],
         on_complete: Callable[[str, str], None],
         proxy: Optional[Dict[str, Any]] = None,
+        max_active: int = DEFAULT_MAX_ACTIVE,
     ):
         self.download_dir = str(Path(download_dir))
         self.on_progress = on_progress
         self.on_complete = on_complete
         # {"host": str, "port": int, "username": Optional[str], "password": Optional[str]}
         self.proxy = proxy
+        self.max_active = clamp_max_active(max_active)
 
         self._lt: Any = _try_import_libtorrent()
         self._session: Any = None
@@ -130,6 +209,16 @@ class TorrentDownloader:
         self._aria2c_procs: Dict[str, subprocess.Popen] = {}
         self._progress: Dict[str, float] = {}
         self._names: Dict[str, str] = {}
+        # Torrents admitted but not started: over the concurrency limit, they
+        # wait here for a slot. (tid, target, name) — target is a magnet URI or
+        # a .torrent path, i.e. exactly what _start_one needs to begin.
+        self._waiting: list = []
+        # Reserved slots: torrents past the capacity check but not yet landed
+        # in _handles/_aria2c_procs.
+        self._starting: set = set()
+        # What each live torrent was started from, so a session that ends with
+        # transfers in flight can resume them on the next launch.
+        self._sources: Dict[str, str] = {}
         self._running = False
         self._poll_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -191,6 +280,9 @@ class TorrentDownloader:
             self._aria2c_procs.clear()
             self._progress.clear()
             self._names.clear()
+            self._waiting.clear()
+            self._starting.clear()
+            self._sources.clear()
         if self._session is not None:
             for handle in handles:
                 try:
@@ -205,38 +297,39 @@ class TorrentDownloader:
             except Exception:
                 pass
 
-    def add(self, path: str) -> Optional[str]:
+    def add(self, path: str, resume: bool = False) -> Optional[str]:
+        """Start (or queue) a transfer.
+
+        *resume* marks a transfer picked up from a previous session, whose
+        partial data is already sitting in the download dir — see
+        _start_aria2c for what that changes.
+        """
         if not self._running:
             return None
+        resolved = self._resolve(path)
+        if resolved is None:
+            return None
+        target, name = resolved
+        tid = str(uuid.uuid4())
+        self._names[tid] = name
+        self._progress[tid] = 0.0
+        return self._admit(tid, target, name, resume)
 
+    def _resolve(self, path: str) -> Optional[tuple]:
+        """Turn what the caller handed us into (target, name), or None.
+
+        The target is what actually starts a transfer — a magnet URI, or a
+        .torrent path — so a queued or resumed torrent can be started later
+        from nothing more than this pair.
+        """
         p = Path(path)
 
         if p.suffix.lower() == ".torrent":
             if self._lt is None and _find_aria2c() is None:
                 return None
-            name = _torrent_info_name(str(p)) or p.stem
-            tid = str(uuid.uuid4())
-            self._names[tid] = name
-            self._progress[tid] = 0.0
-            if self._lt is not None:
-                try:
-                    info = self._lt.torrent_info(str(p))
-                    params = self._lt.add_torrent_params()
-                    params.ti = info
-                    params.save_path = self.download_dir
-                    params.storage_mode = self._lt.storage_mode_t.storage_mode_sparse
-                    handle = self._session.add_torrent(params)
-                    with self._lock:
-                        self._handles[tid] = handle
-                    return tid
-                except Exception:
-                    self._names.pop(tid, None)
-                    self._progress.pop(tid, None)
-                    return None
-            else:
-                return self._start_aria2c(tid, str(p), name)
+            return str(p), (_torrent_info_name(str(p)) or p.stem)
 
-        elif p.suffix.lower() == ".magnet":
+        if p.suffix.lower() == ".magnet":
             try:
                 uri = p.read_text(encoding="utf-8").strip()
             except Exception:
@@ -245,39 +338,107 @@ class TorrentDownloader:
                 return None
             if self._lt is None and _find_aria2c() is None:
                 return None
-            name = _extract_magnet_name(uri) or p.stem
-            tid = str(uuid.uuid4())
-            self._names[tid] = name
-            self._progress[tid] = 0.0
-            return self._add_magnet(tid, uri, name)
+            return uri, (_extract_magnet_name(uri) or p.stem)
 
-        elif path.startswith("magnet:?"):
+        if path.startswith("magnet:?"):
             if self._lt is None and _find_aria2c() is None:
                 return None
-            name = _extract_magnet_name(path) or "magnet"
-            tid = str(uuid.uuid4())
-            self._names[tid] = name
-            self._progress[tid] = 0.0
-            return self._add_magnet(tid, path, name)
+            return path, (_extract_magnet_name(path) or "magnet")
 
         return None
 
-    def _add_magnet(self, tid: str, uri: str, name: str) -> Optional[str]:
-        if self._lt is not None:
-            try:
-                params = self._lt.parse_magnet_uri(uri)
-                params.save_path = self.download_dir
-                params.storage_mode = self._lt.storage_mode_t.storage_mode_sparse
-                handle = self._session.add_torrent(params)
-                with self._lock:
-                    self._handles[tid] = handle
+    # ------------------------------------------------------------------
+    # Concurrency limit
+    # ------------------------------------------------------------------
+    def _active_count(self) -> int:
+        """Live transfers. Caller holds the lock.
+
+        Counts torrents still being spawned as well as running ones —
+        _start_aria2c only lands in _aria2c_procs once Popen returns, and
+        without the reservation two concurrent adds could both look at an
+        empty slot and take it.
+        """
+        return len(self._handles) + len(self._aria2c_procs) + len(self._starting)
+
+    def _admit(
+        self, tid: str, target: str, name: str, resume: bool = False
+    ) -> Optional[str]:
+        """Start *tid* now, or park it until a slot frees up."""
+        with self._lock:
+            if self._active_count() >= self.max_active:
+                self._waiting.append((tid, target, name, resume))
+                self.on_progress(tid, name, PROGRESS_QUEUED)
                 return tid
-            except Exception:
-                self._names.pop(tid, None)
-                self._progress.pop(tid, None)
-                return None
-        else:
-            return self._start_aria2c(tid, uri, name)
+            self._starting.add(tid)
+        return self._start_one(tid, target, name, resume)
+
+    def _pump(self) -> None:
+        """Start as many waiting torrents as there are free slots."""
+        while True:
+            with self._lock:
+                if not self._waiting or self._active_count() >= self.max_active:
+                    return
+                tid, target, name, resume = self._waiting.pop(0)
+                self._starting.add(tid)
+            self._start_one(tid, target, name, resume)
+
+    def set_max_active(self, value: Any) -> None:
+        """Change the limit while running. Raising it starts waiting torrents;
+        lowering it only stops new ones from starting — transfers already in
+        flight are left alone rather than being killed mid-download."""
+        self.max_active = clamp_max_active(value)
+        self._pump()
+
+    def snapshot(self) -> list:
+        """Everything unfinished, as {tid, target, name} — live first.
+
+        This is what lets a session that ends with transfers in flight pick
+        them up next launch: the target is the magnet URI or the staged
+        .torrent copy aria2c was actually given, so a resume is just an add.
+        """
+        with self._lock:
+            live_ids = list(self._handles) + list(self._aria2c_procs)
+            out = [
+                {"tid": tid, "target": self._sources[tid],
+                 "name": self._names.get(tid, "")}
+                for tid in live_ids if tid in self._sources
+            ]
+            out += [
+                {"tid": tid, "target": target, "name": name}
+                for tid, target, name, _resume in self._waiting
+            ]
+        return out
+
+    def _start_one(
+        self, tid: str, target: str, name: str, resume: bool = False
+    ) -> Optional[str]:
+        """Hand a resolved (target, name) to whichever backend is available."""
+        try:
+            if self._lt is not None:
+                return self._start_libtorrent(tid, target, name)
+            return self._start_aria2c(tid, target, name, resume)
+        finally:
+            with self._lock:
+                self._starting.discard(tid)
+
+    def _start_libtorrent(self, tid: str, target: str, name: str) -> Optional[str]:
+        try:
+            if target.startswith("magnet:?"):
+                params = self._lt.parse_magnet_uri(target)
+            else:
+                params = self._lt.add_torrent_params()
+                params.ti = self._lt.torrent_info(target)
+            params.save_path = self.download_dir
+            params.storage_mode = self._lt.storage_mode_t.storage_mode_sparse
+            handle = self._session.add_torrent(params)
+            with self._lock:
+                self._handles[tid] = handle
+                self._sources[tid] = target
+            return tid
+        except Exception:
+            self._names.pop(tid, None)
+            self._progress.pop(tid, None)
+            return None
 
     @staticmethod
     def _stage_torrent(target: str) -> tuple[str, Optional[str]]:
@@ -300,7 +461,9 @@ class TorrentDownloader:
         except OSError:
             return target, None
 
-    def _start_aria2c(self, tid: str, target: str, name: str) -> Optional[str]:
+    def _start_aria2c(
+        self, tid: str, target: str, name: str, resume: bool = False
+    ) -> Optional[str]:
         aria2c = _find_aria2c()
         if aria2c is None:
             self._names.pop(tid, None)
@@ -310,8 +473,29 @@ class TorrentDownloader:
         staged, tmp_dir = self._stage_torrent(target)
         cmd = [
             aria2c, "--seed-time=0", "--summary-interval=1",
+            # Pick up where an interrupted transfer left off instead of
+            # starting the file again. For BitTorrent aria2c resumes from its
+            # own ".aria2" control file in the download dir; --continue covers
+            # the plain HTTP/FTP sources a torrent's web seeds can use.
+            "--continue=true",
+            # Closing Plunder kills aria2c outright, so whatever is in the
+            # control file at that instant is all a resume gets. The default
+            # 60s between saves can throw away a minute of transfer — and,
+            # worse, leaves no control file at all for a torrent that started
+            # less than a minute ago, which reads downstream as "finished".
+            f"--auto-save-interval={CONTROL_SAVE_INTERVAL}",
+            # Keep a magnet's metadata as a .torrent beside the data, so a
+            # resume doesn't have to go back to the DHT for it.
+            "--bt-save-metadata=true",
             "-d", self.download_dir,
         ]
+        if resume:
+            # Hash-check what is already on disk and carry on from there.
+            # Without this aria2c trusts the control file alone, so a stale
+            # one (or none at all, if the process was killed before the first
+            # save) means the partial data is discarded and the torrent
+            # restarts from zero.
+            cmd.append("--check-integrity=true")
         if self.proxy:
             cmd.append(
                 f"--all-proxy=socks5h://{self.proxy['host']}:{self.proxy['port']}"
@@ -337,6 +521,10 @@ class TorrentDownloader:
             return None
         with self._lock:
             self._aria2c_procs[tid] = proc
+            # The staged copy, not the caller's original: the original may be
+            # deleted right after adding, while the copy is exactly what a
+            # resume needs to hand aria2c again.
+            self._sources[tid] = staged
         self.on_progress(tid, name, 0.0)
         self._spawn_aria2c_monitor(tid, proc, name, tmp_dir)
         return tid
@@ -372,11 +560,18 @@ class TorrentDownloader:
             except Exception:
                 pass
             finally:
-                if tmp_dir:
+                # Keep the staged .torrent when the app is shutting down —
+                # that copy is the only way to resume this transfer next
+                # launch (the user's original may be long deleted). Anything
+                # left unreferenced is swept at the next restore.
+                if tmp_dir and self._running:
                     shutil.rmtree(tmp_dir, ignore_errors=True)
             with self._lock:
                 self._aria2c_procs.pop(tid, None)
-                self._progress[tid] = 1.0 if rc == 0 else -1.0
+                if rc == 0 or self._running:
+                    self._sources.pop(tid, None)
+                self._progress[tid] = 1.0 if rc == 0 else PROGRESS_ERROR
+            self._pump()
             if rc == 0:
                 self.on_progress(tid, name, 1.0)
                 # aria2c's own stdout doesn't reliably report a multi-file
@@ -412,6 +607,8 @@ class TorrentDownloader:
                             self._handles.pop(tid, None)
                             self._progress.pop(tid, None)
                             self._names.pop(tid, None)
+                            self._sources.pop(tid, None)
+                        self._pump()
 
     def _poll_loop(self) -> None:
         while self._running:
@@ -433,5 +630,9 @@ class TorrentDownloader:
                 except Exception:
                     pass
                 del self._aria2c_procs[tid]
+            self._waiting[:] = [w for w in self._waiting if w[0] != tid]
+            self._starting.discard(tid)
             self._progress.pop(tid, None)
             self._names.pop(tid, None)
+            self._sources.pop(tid, None)
+        self._pump()

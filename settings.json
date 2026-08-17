@@ -6,7 +6,17 @@
   "monitor_enabled": true,
   "monitor_folder": "C:/Users/psilo/Downloads",
   "torrent_enabled": true,
-  "torrent_download_folder": "C:/Users/psilo/Downloads",
-  "torrent_finished_folder": null,
-  "torrent_delete_source": true
+  "torrent_delete_source": true,
+  "move_music_enabled": false,
+  "move_music_folder": null,
+  "move_video_enabled": false,
+  "move_video_folder": null,
+  "sounds_enabled": true,
+  "sound_volume": 100,
+  "proxy_enabled": false,
+  "proxy_host": null,
+  "proxy_port": null,
+  "proxy_username": null,
+  "proxy_password": null,
+  "torrent_ext_association_asked": false
 }
