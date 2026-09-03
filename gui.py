@@ -1508,6 +1508,15 @@ class App(TkinterDnD.Tk):
         self._mode = mode
         self._video_paths = videos
 
+        # A direct drop/browse (0 or 1 CUE) reaches _start_conversion without
+        # ever going through _enqueue_conversion, so nothing has put rows in
+        # the encoding box yet — without this, conversion runs entirely
+        # invisibly until the final "Done" sound.
+        for f in flacs:
+            self._add_encoding_progress(f, Path(f).name)
+        for v in videos:
+            self._add_encoding_progress(v, Path(v).name)
+
         self._set_info("Files loaded", SAGE)
         self._start_conversion()
 
@@ -2840,6 +2849,12 @@ class App(TkinterDnD.Tk):
     # Encoding progress (encoding box)
     # ------------------------------------------------------------------
     def _add_encoding_progress(self, task_id: str, name: str) -> None:
+        # Idempotent: a batch queued via _enqueue_conversion already has rows
+        # by the time _load_files runs for it, and _load_files adds its own
+        # rows for the direct-drop path where nothing added them yet — this
+        # guard is what lets both call it without producing duplicate rows.
+        if task_id in self._encoding_progress_widgets:
+            return
         frame = tk.Frame(self._encoding_progress_frame, bg=BG)
         frame.pack(fill="x", padx=2 * SCALE, pady=1 * SCALE)
         short_name = name if len(name) <= 20 else name[:17] + "..."

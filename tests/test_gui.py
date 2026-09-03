@@ -934,6 +934,70 @@ def test_enqueue_conversion_rejects_invalid_batch_without_adding_rows(tmp_path):
     assert host.queue_processed is False
 
 
+# --- _load_files (direct drop/browse, 0-1 CUE) also adds encoding rows ---
+#
+# _enqueue_conversion (multi-disc batches) always added rows before
+# conversion started. But a direct drop or browse with 0 or 1 CUE skips
+# _enqueue_conversion entirely and calls _load_files -> _start_conversion
+# straight away, so it never added any rows — conversion ran with nothing
+# visible in the encoding box until the final "Done" sound.
+
+class _LoadFilesHost:
+    """Stand-in for _load_files: real method, no Tk, no real conversion
+    (that path spawns threads/ffmpeg — out of scope here)."""
+
+    _load_files = App._load_files
+
+    def __init__(self):
+        self.added_rows = []
+        self.info_messages = []
+        self.conversion_started = False
+
+    def _add_encoding_progress(self, task_id, name):
+        self.added_rows.append(task_id)
+
+    def _set_info(self, text, color=None):
+        self.info_messages.append(text)
+
+    def _start_conversion(self):
+        self.conversion_started = True
+
+
+def test_load_files_adds_rows_for_direct_drop(tmp_path):
+    f1 = tmp_path / "01.flac"
+    f2 = tmp_path / "02.flac"
+    f1.write_bytes(b"a")
+    f2.write_bytes(b"b")
+
+    host = _LoadFilesHost()
+    host._load_files([str(f1), str(f2)])
+
+    assert host.added_rows == [str(f1), str(f2)]
+    assert host.conversion_started is True
+
+
+def test_load_files_adds_rows_for_video_drop(tmp_path):
+    v = tmp_path / "movie.mkv"
+    v.write_bytes(b"x")
+
+    host = _LoadFilesHost()
+    host._load_files([str(v)])
+
+    assert host.added_rows == [str(v)]
+
+
+def test_load_files_adds_no_rows_and_does_not_start_on_invalid_selection(tmp_path):
+    bogus = tmp_path / "notes.txt"
+    bogus.write_bytes(b"not media")
+
+    host = _LoadFilesHost()
+    host._load_files([str(bogus)])
+
+    assert host.added_rows == []
+    assert host.conversion_started is False
+    assert host.info_messages == ["Unsupported file type"]
+
+
 # --- staged-download recovery (orphaned aria2c child finished after
 # Hoarder itself was closed/killed mid-download) ---
 
