@@ -132,12 +132,16 @@ def transcode_videos(
     delete_source: bool = False,
     encoder: Optional[str] = None,
     _run_full_fn: Optional[Callable] = None,
+    on_unreadable: Optional[Callable[[str, str], None]] = None,
 ) -> None:
     """Transcode video files to H.265 MP4 with AAC audio.
 
     encoder: force a specific encoder (e.g. 'libx265', 'hevc_nvenc'); None = auto-detect GPU.
     Skips files already encoded as H.265 MP4.
     Skips files where predicted H.265 output would be larger than source.
+    Skips files ffprobe can't read at all (corrupt or truncated downloads,
+    stray placeholders) — reported via on_unreadable(path, error) rather than
+    raising, so one bad file doesn't abort every other file in the batch.
     progress_callback(current, total) is called AFTER each file completes (including skips).
       current may be a float (i-1 + within-file fraction) to support sub-file progress.
     _run_full_fn: injectable replacement for _run_ffmpeg_progress (used in tests).
@@ -152,7 +156,13 @@ def transcode_videos(
     for i, video_path in enumerate(video_paths, start=1):
         src = Path(video_path)
 
-        info = probe_video(video_path)
+        try:
+            info = probe_video(video_path)
+        except RuntimeError as e:
+            if on_unreadable is not None:
+                on_unreadable(video_path, str(e))
+            progress_callback(i, total)
+            continue
         codec       = info["codec"]
         duration    = info["duration"]
         source_size = info["size"]

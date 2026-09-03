@@ -516,6 +516,28 @@ def test_startup_scan_skips_torrent_staging_folder(tmp_path):
     assert host.enqueued == []
 
 
+def test_startup_scan_skips_zero_byte_video(tmp_path):
+    """A stray 0-byte placeholder (e.g. an aria2/torrent artifact) must not
+    be queued — ffprobe fails on it with no usable error message."""
+    (tmp_path / "placeholder.mkv").write_bytes(b"")
+    real = tmp_path / "movie.mp4"
+    real.write_bytes(b"h265 data")
+
+    host = _ScanHost()
+    host._scan_existing_files(str(tmp_path))
+    assert host.enqueued == [[str(real)]]
+
+
+def test_startup_scan_skips_zero_byte_audio(tmp_path):
+    (tmp_path / "placeholder.flac").write_bytes(b"")
+    real = tmp_path / "track.flac"
+    real.write_bytes(b"fLaC" + b"\x00" * 100)
+
+    host = _ScanHost()
+    host._scan_existing_files(str(tmp_path))
+    assert host.enqueued == [[str(real)]]
+
+
 # --- torrent completion: move out of staging, then convert ---
 
 import types

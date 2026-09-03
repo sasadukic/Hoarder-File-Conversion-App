@@ -15,7 +15,10 @@ _POLL_INTERVAL = 0.1
 
 
 def _wait_stable(path: Path) -> bool:
-    """Poll until file size is stable for _STABLE_SECS. Returns False if file disappears."""
+    """Poll until file size is stable for _STABLE_SECS. Returns False if the
+    file disappears or settles at 0 bytes — a stray placeholder (e.g. an
+    aria2/torrent artifact) rather than real media, which would otherwise
+    reach ffprobe and fail with no usable error."""
     prev_size = -1
     stable_since = None
     while True:
@@ -27,7 +30,7 @@ def _wait_stable(path: Path) -> bool:
             if stable_since is None:
                 stable_since = time.monotonic()
             elif time.monotonic() - stable_since >= _STABLE_SECS:
-                return True
+                return size > 0
         else:
             stable_since = None
         prev_size = size

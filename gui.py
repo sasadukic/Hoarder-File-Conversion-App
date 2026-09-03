@@ -1406,8 +1406,15 @@ class App(TkinterDnD.Tk):
     # Drop / browse
     # ------------------------------------------------------------------
     def _on_drop(self, event) -> None:
-        paths = expand_drops(parse_drop_paths(event.data))
-        self._handle_paths(paths)
+        # Unlike every other entry point into the pipeline, this one runs
+        # straight off a raw OS callback with no caller to catch a mistake —
+        # in the built exe (console=False) an uncaught exception here has
+        # nowhere to print to, so the drop silently does nothing at all.
+        try:
+            paths = expand_drops(parse_drop_paths(event.data))
+            self._handle_paths(paths)
+        except Exception as e:
+            self._set_info(f"Drop failed: {e}", WARM)
 
     def _browse(self) -> None:
         self._play_click()
@@ -1621,13 +1628,26 @@ class App(TkinterDnD.Tk):
                     delete_companion_files(flacs, cue)
 
             # --- Video ---
+            unreadable_videos: List[str] = []
+
+            def on_unreadable(path: str, error: str) -> None:
+                unreadable_videos.append(path)
+                self.after(0, self._set_info,
+                           f"Skipped {Path(path).name} (unreadable — corrupt or incomplete download)",
+                           WARM)
+
             if videos:
                 # Claim the outputs before ffmpeg writes them, so the folder
                 # monitor does not treat them as newly arrived source files.
                 for v in videos:
                     self._ignore_output(str(video_output_path(Path(v))))
-                transcode_videos(videos, on_video_progress, delete_source=do_delete)
+                transcode_videos(videos, on_video_progress, delete_source=do_delete,
+                                  on_unreadable=on_unreadable)
 
+            # Files ffprobe couldn't even read are left out of the library
+            # mark below — that's what lets them keep showing up (and being
+            # reported) on future scans instead of silently passing as done.
+            videos = [v for v in videos if v not in unreadable_videos]
             video_outputs = self._video_outputs(videos)
 
             # Move converted files out of the monitored folder, per type.
@@ -2984,11 +3004,20 @@ class App(TkinterDnD.Tk):
         def _not_staging(p: Path) -> bool:
             return STAGING_DIRNAME not in p.parts
 
+        def _usable(p: Path) -> bool:
+            # Skip stray 0-byte placeholders (e.g. aria2/torrent artifacts left
+            # behind in the folder) — real media is never empty, and handing
+            # one of these to ffprobe fails with no usable error message.
+            try:
+                return p.stat().st_size > 0
+            except OSError:
+                return False
+
         # --- Audio: collect all supported formats, group by parent directory ---
         audio_by_dir: dict[Path, list[Path]] = {}
         for ext in AUDIO_EXTS:
             for audio in sorted(folder_path.rglob(f"*{ext}")):
-                if _not_staging(audio):
+                if _not_staging(audio) and _usable(audio):
                     audio_by_dir.setdefault(audio.parent, []).append(audio)
         for d in audio_by_dir:
             audio_by_dir[d].sort()
@@ -3014,7 +3043,7 @@ class App(TkinterDnD.Tk):
         videos_by_dir: dict[Path, list[str]] = {}
         for pat in ("*.mp4", "*.mkv", "*.mov", "*.wmv", "*.avi"):
             for vid in sorted(folder_path.rglob(pat)):
-                if _not_staging(vid):
+                if _not_staging(vid) and _usable(vid):
                     videos_by_dir.setdefault(vid.parent, []).append(str(vid))
         for dir_path in sorted(videos_by_dir):
             self.after(0, self._enqueue_new, videos_by_dir[dir_path])

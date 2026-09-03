@@ -366,6 +366,49 @@ def test_transcode_progress_called_after_work(tmp_path):
     assert call_order == ["ffmpeg_sample", "ffmpeg_full", "progress"]
 
 
+def test_transcode_skips_unreadable_file_without_aborting_batch(tmp_path):
+    """A file ffprobe can't read (corrupt/truncated download) must be
+    reported via on_unreadable and skipped — not raised — so the rest of
+    the batch still transcodes."""
+    good = str(tmp_path / "good.mkv")
+    bad = str(tmp_path / "corrupt.mkv")
+    (tmp_path / "good.mkv").write_bytes(b"x" * 50_000_000)
+    (tmp_path / "corrupt.mkv").write_bytes(b"\x00" * 50_000_000)
+
+    mock_ok = MagicMock()
+    mock_ok.returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        Path(cmd[-1]).write_bytes(b"x" * 1_000_000)
+        return mock_ok
+
+    def fake_full(cmd, duration, on_pct, error_prefix):
+        Path(cmd[-1]).write_bytes(b"x" * 20_000_000)
+
+    def fake_probe(path):
+        if path == bad:
+            raise RuntimeError("ffprobe failed: Invalid data found when processing input")
+        return _make_probe(codec="h264", duration=120.0, size=50_000_000)
+
+    unreadable = []
+    progress_calls = []
+
+    with patch("converter.probe_video", side_effect=fake_probe):
+        with patch("converter.subprocess.run", side_effect=fake_run):
+            transcode_videos(
+                [bad, good],
+                lambda cur, total: progress_calls.append((cur, total)),
+                encoder="libx265",
+                _run_full_fn=fake_full,
+                on_unreadable=lambda path, err: unreadable.append((path, err)),
+            )
+
+    assert len(unreadable) == 1
+    assert unreadable[0][0] == bad
+    assert "ffprobe failed" in unreadable[0][1]
+    assert progress_calls == [(1, 2), (2, 2)]
+
+
 # --- encoder detection ---
 
 from converter import _detect_hevc_encoder

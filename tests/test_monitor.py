@@ -159,6 +159,21 @@ def test_excluded_dirname_is_never_processed(tmp_path):
         m.stop()
 
 
+def test_ignores_zero_byte_video(tmp_path):
+    """A stray 0-byte placeholder (e.g. an aria2/torrent artifact) must not
+    trigger conversion — ffprobe fails on it with no usable error message."""
+    received = []
+    m = FolderMonitor(str(tmp_path), lambda paths: received.append(paths), lambda paths: None)
+    m.start()
+    try:
+        mkv = tmp_path / "placeholder.mkv"
+        mkv.write_bytes(b"")
+        time.sleep(0.8)
+        assert received == []
+    finally:
+        m.stop()
+
+
 def test_non_excluded_files_still_work_alongside_exclusion(tmp_path):
     """The exclusion is scoped to its own subfolder — everything else in the
     monitored tree still converts normally."""
