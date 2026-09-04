@@ -30,7 +30,7 @@ from tkinterdnd2 import TkinterDnD, DND_FILES
 
 from cue_parser import parse_cue, cue_file_ref
 from converter import (
-    AUDIO_EXTS, check_ffmpeg, split_and_convert, convert_files,
+    AUDIO_EXTS, VIDEO_EXTS, check_ffmpeg, split_and_convert, convert_files,
     delete_flacs, delete_companion_files, transcode_videos, video_output_path,
 )
 import settings as smod
@@ -43,7 +43,6 @@ MODE_CONVERT = "Convert Only"
 MODE_VIDEO  = "Video Transcode"
 MODE_MIXED  = "Mixed"
 
-VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".wmv", ".avi"}
 TORRENT_EXTS = {".torrent", ".magnet"}
 
 
@@ -368,7 +367,7 @@ def expand_drops(paths: List[str]) -> List[str]:
     Searches recursively so dropping a discography/parent folder picks up files
     in all sub-albums.
     """
-    _video_globs = ("*.mp4", "*.mkv", "*.mov", "*.wmv", "*.avi")
+    _video_globs = tuple(f"*{ext}" for ext in sorted(VIDEO_EXTS))
     result = []
     for p in paths:
         path = Path(p)
@@ -3056,7 +3055,7 @@ class App(TkinterDnD.Tk):
 
         # --- Video: group by parent directory ---
         videos_by_dir: dict[Path, list[str]] = {}
-        for pat in ("*.mp4", "*.mkv", "*.mov", "*.wmv", "*.avi"):
+        for pat in (f"*{ext}" for ext in sorted(VIDEO_EXTS)):
             for vid in sorted(folder_path.rglob(pat)):
                 if _not_staging(vid) and _usable(vid):
                     videos_by_dir.setdefault(vid.parent, []).append(str(vid))

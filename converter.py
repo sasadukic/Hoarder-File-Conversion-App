@@ -23,6 +23,15 @@ AUDIO_EXTS: frozenset[str] = frozenset({
     ".flac", ".alac", ".m4a", ".ape", ".aiff", ".aif", ".dsf", ".dff", ".wma",
 })
 
+# Video container extensions Hoarder will pick up for transcoding. ffmpeg
+# handles the actual demux/decode, so this just needs to cover formats
+# people actually have lying around.
+VIDEO_EXTS: frozenset[str] = frozenset({
+    ".mp4", ".mkv", ".mov", ".wmv", ".avi", ".divx", ".flv", ".webm",
+    ".mpg", ".mpeg", ".m4v", ".ts", ".m2ts", ".mts", ".3gp", ".3g2",
+    ".vob", ".asf", ".ogv", ".m2v",
+})
+
 
 def _ffmpeg_exe() -> str:
     """Path to ffmpeg: dev-local bin/, else the auto-download cache, else PATH."""

@@ -7,7 +7,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from cue_parser import cue_file_ref
-from converter import AUDIO_EXTS as _AUDIO_EXTS
+from converter import AUDIO_EXTS as _AUDIO_EXTS, VIDEO_EXTS as _VIDEO_EXTS
 
 # How long the file size must be stable before we consider it fully written.
 _STABLE_SECS = 0.5
@@ -37,7 +37,6 @@ def _wait_stable(path: Path) -> bool:
         time.sleep(_POLL_INTERVAL)
 
 
-_VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".wmv", ".avi"}
 _TORRENT_EXTS = {".torrent", ".magnet"}
 
 
