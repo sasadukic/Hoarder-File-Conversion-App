@@ -2549,6 +2549,11 @@ class App(TkinterDnD.Tk):
 
     def _handle_magnet_link(self, magnet_uri: str) -> None:
         """Handle a magnet URI passed via command line or browser."""
+        # A magnet handed off from another process (main.py's pipe server)
+        # lands here with the window possibly hidden in the tray — surface
+        # it, otherwise the add happens invisibly and looks like the click
+        # in the browser did nothing.
+        self._restore_from_tray()
         if not self._torrent_var.get():
             self._torrent_var.set(True)
             self._start_torrent_downloader()
