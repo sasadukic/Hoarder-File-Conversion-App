@@ -3,6 +3,7 @@ import ctypes.wintypes as wt
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 # Cache pythonw.exe path for run.vbs (silent launcher) — skip when bundled.
@@ -27,7 +28,18 @@ from gui import App
 
 kernel32 = ctypes.windll.kernel32
 _PIPE_NAME = r"\\.\pipe\HoarderMagnet"
+_MUTEX_NAME = "HoarderSingleInstanceMutex"
 _BUFSIZE = 4096
+_ERROR_ALREADY_EXISTS = 183
+
+
+def _acquire_single_instance_lock() -> bool:
+    """Atomically claim ownership of the app. Returns True if this is the
+    first (and only) instance. The handle is intentionally leaked — Windows
+    releases it when the process exits — so it stays held for the app's
+    whole lifetime instead of being dropped as soon as this function returns."""
+    kernel32.CreateMutexW(None, wt.BOOL(False), _MUTEX_NAME)
+    return ctypes.GetLastError() != _ERROR_ALREADY_EXISTS
 
 
 def _parse_magnet_arg() -> str | None:
@@ -115,8 +127,16 @@ if __name__ == "__main__":
     torrent_file = _parse_torrent_file_arg()
     link_arg = magnet_uri or torrent_file
 
-    # If another instance is running, send it the link/file and exit
-    if _try_send_to_existing(link_arg):
+    # The mutex check is atomic, unlike probing for the pipe: it's what
+    # actually prevents two near-simultaneous launches from both deciding
+    # no instance is running and both opening a GUI.
+    if not _acquire_single_instance_lock():
+        # Another instance owns the app but may still be mid-startup and not
+        # yet listening on the pipe, so retry briefly before giving up.
+        for _ in range(50):
+            if _try_send_to_existing(link_arg):
+                break
+            time.sleep(0.1)
         sys.exit(0)
 
     app = App(start_in_tray=start_in_tray)
